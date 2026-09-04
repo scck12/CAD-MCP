@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# Logs
+*.log
+
+# Backup files
+*.bak
+
+# Generated output drawings
+output/
+
+# One-off local diagnostics / scratch probes (findings captured in history.md / spec.md)
+src/sig.py
+src/sig2.py
+src/sig3.py
+src/sig4.py
+src/sig5.py
+src/sig6.py
+src/sig7.py
+src/probe.py
+test_cadian.py
