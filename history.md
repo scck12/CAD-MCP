@@ -168,3 +168,56 @@ _korean_font()`에 `_MAX_FONT_SIZE=200` clamp를 추가해 수정. 같은 `zoom_
 
 **스펙 반영**: `spec.md`의 "MCP 도구 목록"에 새 파라미터들과 "언제 어떤
 도구를 쓸지" 가이드를 추가, "알려진 함정"에 폰트 크기 폭주 항목 추가.
+
+## 2026-09-04 — 소스 코드 주석/로그/도구 설명을 중국어·영어에서 한국어로 번역
+
+**계기**: 원 저장소가 중국어 화자가 작성한 프로젝트라 `server.py`,
+`cad_controller.py`, `nlp_processor.py`, `__init__.py`에 중국어 주석/
+docstring/로그 메시지/MCP 도구 설명이 많이 남아 있었음(총 500줄 이상).
+사용자가 전부 한국어로 번역해 달라고 요청.
+
+**작업**: 파일별로 백그라운드 에이전트 3개를 병렬로 돌려 번역(server.py,
+cad_controller.py, nlp_processor.py 각각 1개). `__init__.py`는 짧아서 직접
+번역.
+
+**중요한 예외 — nlp_processor.py는 전부 번역하면 안 된다**:
+`NLPProcessor`(자연어 명령 파서, `process_command`가 사용)는 사용자가
+입력한 **중국어 단어 자체를 매칭**해서 도형 종류/색상/동작을 인식한다.
+아래는 주석이 아니라 매칭 로직이므로 번역하지 않고 그대로 남겨둠 —
+번역하면 한국어 지원이 추가되는 게 아니라 중국어 명령 인식이 조용히
+깨지기만 한다:
+- `self.color_rgb_map` / `self.shape_keywords` / `self.action_keywords`
+  딕셔너리의 키(예: `"红色"`, `"直线"`, `"画"` 등)
+- `radius_pattern`, `width_pattern`, `height_pattern`, `text_pattern`,
+  `rotation_pattern`, `scale_pattern`, `path_pattern`,
+  `start_angle_pattern`, `end_angle_pattern`, `color_pattern`,
+  `pattern_patterns` 등 중국어/영어 키워드를 매칭하는 정규식 문자열
+- `"图层" in command`, `"标注" in command`, `"闭合" in command` 같은
+  부분 문자열 검사
+
+주석/docstring/로그 메시지(`self.logger.info(...)` 등)와, 매칭 키가
+아니라 결과로 반환되는 사람이 읽는 문자열(`"error"`, `"note"`,
+`"message"` 필드 값)은 정상적으로 한국어로 번역함.
+
+`cad_controller.py`의 `APP_IDS` 딕셔너리에 있는 浩辰CAD(GstarCAD),
+中望CAD(ZWCAD) 표시명도 실제 중국어 제품명이라 번역하지 않고 남김(주변
+로그 문장은 한국어로 번역됨).
+
+**검증**:
+- 세 파일 모두 `py_compile` 통과.
+- `nlp_processor.py`는 번역 후 실제 중국어 명령 파싱 스모크 테스트
+  ("画一个圆心在(10,20)半径为30的圆" → `draw_circle`, 반지름 30 정상 인식,
+  "红色" → 색상 인덱스 1 정상 인식)로 매칭 로직이 안 깨졌음을 직접 확인.
+- 전체 파일에 대해 중국어 문자(U+4E00-U+9FFF) 잔존 여부를 정규식으로
+  스캔 → 위에 나열한 의도적 예외들만 남고 나머지는 0건 확인. 에이전트가
+  `color_rgb_map` 등 딕셔너리 바로 위의 짧은 라벨 주석(`# 基本颜色` 등)
+  5개를 지나치게 조심해서 실수로 안 옮긴 게 있었는데, 이건 데이터가
+  아니라 순수 주석이라 직접 마저 번역함.
+- 서버 재시작 후 `get_drawing_info` 등 실제 도구 호출 및
+  `cad_mcp.log` 확인으로, 새로 남는 로그가 전부 한국어로 나오는 것을
+  실제 운영 환경에서 확인.
+- 주의: 이 세션의 MCP 클라이언트가 도구 목록(설명 텍스트 포함)을 연결
+  시점에 캐시하고 있어서, 서버 프로세스만 재시작해서는 이 세션에 보이는
+  도구 설명이 갱신되지 않았다(소스 코드 자체는 확인 결과 정상 번역됨).
+  MCP 서버 재연결/앱 재시작이 필요한 이미 알려진 제약(`spec.md` "검증
+  방법" 참고)과 동일한 현상.
