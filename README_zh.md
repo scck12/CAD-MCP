@@ -1,5 +1,7 @@
 # CAD-MCP Server (CAD Model Context Protocol Server)
 
+[English](/README_en.md) | 中文 | [한국어](/README_ko.md)
+
 ## 项目介绍
 
 CAD-MCP是一个创新的CAD控制服务，允许通过自然语言指令控制CAD软件进行绘图操作。该项目结合了自然语言处理和CAD自动化技术，使用户能够通过简单的文本命令创建和修改CAD图纸，无需手动操作CAD界面。

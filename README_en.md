@@ -1,5 +1,7 @@
 # CAD-MCP Server (CAD Model Context Protocol Server)
 
+English | [中文](/README_zh.md) | [한국어](/README_ko.md)
+
 ## Project Introduction
 
 CAD-MCP is an innovative CAD control service that allows controlling CAD software for drawing operations through natural language instructions. This project combines natural language processing and CAD automation technology, enabling users to create and modify CAD drawings through simple text commands without manually operating the CAD interface.
