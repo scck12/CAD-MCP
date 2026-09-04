@@ -5,17 +5,17 @@ import os
 import json
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# 直接读取config.json文件
+# config.json 파일을 직접 읽는다
 config_path = os.path.join(os.path.dirname(__file__), 'config.json')
 with open(config_path, 'r', encoding='utf-8') as f:
     config = json.load(f)
 
 try:
     import win32com.client
-    # pythoncom是pywin32的一部分，不需要单独安装
+    # pythoncom은 pywin32의 일부이므로 별도 설치가 필요 없다
     import pythoncom
 except ImportError:
-    logging.error("无法导入win32com.client或pythoncom，请确保已安装pywin32库")
+    logging.error("win32com.client 또는 pythoncom을 임포트할 수 없습니다. pywin32 라이브러리가 설치되어 있는지 확인하세요")
     raise
 
 logger = logging.getLogger('cad_controller')
@@ -39,19 +39,19 @@ DISPATCH_POINT_TYPES = ("cadian", "icad", "intellicad")
 
 
 class CADController:
-    """CAD控制器类，负责与CAD应用程序交互"""
+    """CAD 컨트롤러 클래스. CAD 응용 프로그램과의 상호작용을 담당한다"""
 
     def __init__(self):
-        """初始化CAD控制器"""
+        """CAD 컨트롤러 초기화"""
         self.app = None
         self.doc = None
-        self.entities = {}  # 存储已创建图形的实体引用，用于后续修改
-        # 从配置文件加载参数
+        self.entities = {}  # 생성된 도형의 엔티티 참조 저장 (후속 수정용)
+        # 설정 파일에서 매개변수 로드
         self.startup_wait_time = config["cad"]["startup_wait_time"]
         self.command_delay = config["cad"]["command_delay"]
-        # 获取CAD类型
+        # CAD 종류 가져오기
         self.cad_type = config["cad"]["type"]
-        # 有效的线宽值列表
+        # 유효한 선두께 값 목록
         self.valid_lineweights = [0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80, 90, 100, 106, 120, 140, 158, 200, 211]
         # 다중 점 인자 생성 전략 캐시 (CADian 전용, 최초 1회만 탐색)
         self._pts_strategy = None
@@ -60,7 +60,7 @@ class CADController:
         self._lineweight_prop = None
         # AddHatch 인자 조합 캐시 (PatternType, HatchObjectType)
         self._hatch_args = None
-        logger.info(f"CAD控制器已初始化 (type={self.cad_type})")
+        logger.info(f"CAD 컨트롤러 초기화 완료 (type={self.cad_type})")
 
     # ==================================================================
     # CADian(IntelliCAD) 호환 계층
@@ -218,13 +218,13 @@ class CADController:
             return dispatch_obj
 
     def start_cad(self) -> bool:
-        """启动CAD并创建或打开一个文档"""
+        """CAD를 시작하고 문서를 새로 만들거나 연다"""
         old_app = None
         try:
-            # 初始化COM
+            # COM 초기화
             pythoncom.CoInitialize()
 
-            # 存储旧实例引用（如果有）以便后续清理
+            # 기존 인스턴스 참조를 저장해 두었다가 나중에 정리한다
             if self.app is not None:
                 old_app = self.app
                 self.app = None
@@ -233,46 +233,46 @@ class CADController:
             app_id, app_name = self._resolve_app_id()
 
             try:
-                # 尝试连接到已运行的CAD实例
-                logger.info(f"尝试连接现有{app_name}实例... (ProgID={app_id})")
+                # 실행 중인 CAD 인스턴스에 연결을 시도한다
+                logger.info(f"기존 {app_name} 인스턴스에 연결 시도... (ProgID={app_id})")
                 try:
                     raw = win32com.client.GetActiveObject(app_id)
                     self.app = self._wrap_early_bound(raw)
-                    logger.info(f"成功连接到已运行的{app_name}实例")
+                    logger.info(f"실행 중인 {app_name} 인스턴스에 연결 성공")
                 except Exception as e:
-                    logger.info(f"未找到运行中的{app_name}实例，将尝试启动新实例: {str(e)}")
+                    logger.info(f"실행 중인 {app_name} 인스턴스를 찾지 못해 새 인스턴스 시작을 시도합니다: {str(e)}")
                     raise
 
-                # 如果当前没有文档，创建一个新文档
+                # 현재 문서가 없으면 새 문서를 만든다
                 try:
                     if self.app.Documents.Count == 0:
-                        logger.info("创建新文档...")
+                        logger.info("새 문서 생성 중...")
                         self.doc = self.app.Documents.Add()
                     else:
-                        logger.info("获取活动文档...")
+                        logger.info("활성 문서 가져오는 중...")
                         self.doc = self.app.ActiveDocument
                 except Exception as doc_ex:
-                    # 如果获取文档失败，强制创建新文档
-                    logger.warning(f"获取文档失败，尝试创建新文档: {str(doc_ex)}")
+                    # 문서 가져오기에 실패하면 강제로 새 문서를 만든다
+                    logger.warning(f"문서 가져오기 실패, 새 문서 생성 시도: {str(doc_ex)}")
                     try:
-                        # 关闭所有打开的文档
+                        # 열려 있는 모든 문서를 닫는다
                         for i in range(self.app.Documents.Count):
                             try:
-                                self.app.Documents.Item(0).Close(False)  # 不保存
+                                self.app.Documents.Item(0).Close(False)  # 저장하지 않음
                             except:
                                 pass
 
-                        # 创建新文档
+                        # 새 문서 생성
                         self.doc = self.app.Documents.Add()
                     except Exception as new_doc_ex:
-                        logger.error(f"创建新文档失败: {str(new_doc_ex)}")
+                        logger.error(f"새 문서 생성 실패: {str(new_doc_ex)}")
                         raise
 
             except Exception as app_ex:
-                # 如果连接失败，启动一个新实例
-                logger.info(f"连接失败，正在启动新的CAD实例: {str(app_ex)}")
+                # 연결에 실패하면 새 인스턴스를 시작한다
+                logger.info(f"연결 실패, 새 CAD 인스턴스를 시작합니다: {str(app_ex)}")
                 try:
-                    logger.info(f"正在启动{app_name}实例... (ProgID={app_id})")
+                    logger.info(f"{app_name} 인스턴스 시작 중... (ProgID={app_id})")
                     try:
                         self.app = win32com.client.gencache.EnsureDispatch(app_id)
                     except Exception as gen_ex:
@@ -280,11 +280,11 @@ class CADController:
                         self.app = win32com.client.Dispatch(app_id)
                     self.app.Visible = True
 
-                    # 等待CAD启动
-                    time.sleep(self.startup_wait_time)  # 使用配置的等待时间
+                    # CAD 시작 대기
+                    time.sleep(self.startup_wait_time)  # 설정된 대기 시간 사용
 
-                    # 获取或创建文档
-                    logger.info("尝试获取文档...")
+                    # 문서를 가져오거나 생성
+                    logger.info("문서 가져오기 시도 중...")
                     try:
                         if self.app.Documents.Count == 0:
                             self.doc = self.app.Documents.Add()
@@ -293,22 +293,22 @@ class CADController:
                     except Exception:
                         self.doc = self.app.ActiveDocument
                 except Exception as new_app_ex:
-                    logger.error(f"启动新CAD实例失败: {str(new_app_ex)}")
+                    logger.error(f"새 CAD 인스턴스 시작 실패: {str(new_app_ex)}")
                     raise
 
-            # 额外安全检查和等待
-            time.sleep(2)  # 给CAD更多时间处理文档创建
+            # 추가 안전 확인 및 대기
+            time.sleep(2)  # CAD가 문서 생성을 처리할 시간을 더 준다
 
             if self.doc is None:
-                raise Exception("无法获取有效的Document对象")
+                raise Exception("유효한 Document 객체를 가져올 수 없습니다")
 
-            # 尝试读取文档属性以验证其有效性
+            # 문서 속성을 읽어 유효성을 검증한다
             try:
                 name = self.doc.Name
-                logger.info(f"文档名称: {name}")
+                logger.info(f"문서 이름: {name}")
             except Exception as name_ex:
-                logger.error(f"无法读取文档名称: {str(name_ex)}")
-                raise Exception("文档对象无效")
+                logger.error(f"문서 이름을 읽을 수 없습니다: {str(name_ex)}")
+                raise Exception("문서 객체가 유효하지 않습니다")
 
             # CADian 계열은 Library 객체가 반드시 필요하므로 여기서 미리 확인
             if self._is_dispatch_point_cad():
@@ -319,14 +319,14 @@ class CADController:
                     logger.error(f"Library 객체를 가져올 수 없습니다: {lib_ex}")
                     raise Exception("CADian Library 객체 사용 불가")
 
-            logger.info("CAD已成功启动和准备")
+            logger.info("CAD 시작 및 준비 완료")
             return True
 
         except Exception as e:
-            logger.error(f"启动CAD失败: {str(e)}")
+            logger.error(f"CAD 시작 실패: {str(e)}")
             return False
         finally:
-            # 清理旧实例
+            # 기존 인스턴스 정리
             if old_app is not None:
                 try:
                     del old_app
@@ -334,17 +334,17 @@ class CADController:
                     pass
 
     def is_running(self) -> bool:
-        """检查CAD是否正在运行"""
+        """CAD가 실행 중인지 확인"""
         return self.app is not None and self.doc is not None
 
     def save_drawing(self, file_path: str) -> bool:
-        """保存当前图纸到指定路径"""
+        """현재 도면을 지정한 경로에 저장"""
         if not self.is_running():
-            logger.error("CAD未运行，无法保存图纸")
+            logger.error("CAD가 실행 중이지 않아 도면을 저장할 수 없습니다")
             return False
 
         try:
-            # 确保目录存在
+            # 디렉터리 존재 확인
             directory = os.path.dirname(file_path)
             if directory:
                 os.makedirs(directory, exist_ok=True)
@@ -353,42 +353,42 @@ class CADController:
             # zoom_extents로 도면 범위를 먼저 재계산해 둔다.
             self.zoom_extents()
 
-            # 保存文件
+            # 파일 저장
             self.doc.SaveAs(file_path)
-            logger.info(f"图纸已保存到: {file_path}")
+            logger.info(f"도면이 저장되었습니다: {file_path}")
 
             return True
         except Exception as e:
-            logger.error(f"保存图纸失败: {str(e)}")
+            logger.error(f"도면 저장 실패: {str(e)}")
             return False
 
     def refresh_view(self) -> None:
-        """刷新CAD视图"""
+        """CAD 뷰 갱신"""
         if self.is_running():
             try:
                 self.doc.Regen(1)  # acAllViewports = 1
             except Exception as e:
-                logger.error(f"刷新视图失败: {str(e)}")
+                logger.error(f"뷰 갱신 실패: {str(e)}")
 
     def validate_lineweight(self, lineweight) -> int:
-        """验证并返回有效的线宽值
+        """유효한 선두께 값을 검증하여 반환
 
-        如果提供的线宽值不在有效值列表中，则返回默认值0
+        제공된 선두께 값이 유효값 목록에 없으면 기본값 0을 반환한다
 
         Args:
-            lineweight: 要验证的线宽值
+            lineweight: 검증할 선두께 값
 
         Returns:
-            有效的线宽值
+            유효한 선두께 값
         """
         if lineweight is None:
             return None
 
-        # 检查线宽是否在有效值列表中
+        # 선두께 값이 유효값 목록에 있는지 확인
         if lineweight in self.valid_lineweights:
             return lineweight
         else:
-            logger.warning(f"线宽值 {lineweight} 无效，将使用默认值 0")
+            logger.warning(f"선두께 값 {lineweight}가 유효하지 않아 기본값 0을 사용합니다")
             return 0
 
     # 엔티티 속성 이름이 CAD별로 다르다.
@@ -446,7 +446,7 @@ class CADController:
     def draw_line(self, start_point: Tuple[float, float, float],
                   end_point: Tuple[float, float, float], layer: str = None,
                   color: int = None, lineweight=None) -> Optional[str]:
-        """绘制直线"""
+        """직선 그리기"""
         if not self.is_running():
             return None
 
@@ -459,20 +459,20 @@ class CADController:
 
             self._apply_style(line, layer, color, lineweight)
 
-            # 刷新视图
+            # 뷰 갱신
             self.refresh_view()
 
-            logger.debug(f"已绘制直线: 起点{start_point}, 终点{end_point}, 图层{layer if layer else '默认'}, 颜色{color if color is not None else '默认'}")
+            logger.debug(f"직선 그리기 완료: 시작점{start_point}, 끝점{end_point}, 레이어{layer if layer else '기본값'}, 색상{color if color is not None else '기본값'}")
             return self._handle_of(line)
 
         except Exception as e:
-            logger.error(f"绘制直线时出错: {str(e)}")
+            logger.error(f"직선 그리기 중 오류 발생: {str(e)}")
             return None
 
     def draw_circle(self, center: Tuple[float, float, float],
                     radius: float, layer: str = None, color: int = None,
                     lineweight=None) -> Optional[str]:
-        """绘制圆"""
+        """원 그리기"""
         if not self.is_running():
             return None
 
@@ -483,27 +483,27 @@ class CADController:
 
             self._apply_style(circle, layer, color, lineweight)
 
-            # 刷新视图
+            # 뷰 갱신
             self.refresh_view()
 
-            logger.debug(f"已绘制圆: 中心{center}, 半径{radius}, 图层{layer if layer else '默认'}, 颜色{color if color is not None else '默认'}")
+            logger.debug(f"원 그리기 완료: 중심{center}, 반지름{radius}, 레이어{layer if layer else '기본값'}, 색상{color if color is not None else '기본값'}")
             return self._handle_of(circle)
 
         except Exception as e:
-            logger.error(f"绘制圆时出错: {str(e)}")
+            logger.error(f"원 그리기 중 오류 발생: {str(e)}")
             return None
 
     def draw_arc(self, center: Tuple[float, float, float],
                  radius: float, start_angle: float, end_angle: float,
                  layer: str = None, color: int = None, lineweight=None) -> Optional[str]:
-        """绘制圆弧"""
+        """호 그리기"""
         if not self.is_running():
             return None
 
         try:
             center = self._normalize(center)
 
-            # 将角度转换为弧度
+            # 각도를 라디안으로 변환
             start_rad = math.radians(start_angle)
             end_rad = math.radians(end_angle)
 
@@ -512,19 +512,19 @@ class CADController:
 
             self._apply_style(arc, layer, color, lineweight)
 
-            # 刷新视图
+            # 뷰 갱신
             self.refresh_view()
 
-            logger.debug(f"已绘制圆弧: 中心{center}, 半径{radius}, 起始角度{start_angle}, 结束角度{end_angle}, 图层{layer if layer else '默认'}, 颜色{color if color is not None else '默认'}")
+            logger.debug(f"호 그리기 완료: 중심{center}, 반지름{radius}, 시작각도{start_angle}, 끝각도{end_angle}, 레이어{layer if layer else '기본값'}, 색상{color if color is not None else '기본값'}")
             return self._handle_of(arc)
         except Exception as e:
-            logger.error(f"绘制圆弧失败: {str(e)}")
+            logger.error(f"호 그리기 실패: {str(e)}")
             return None
 
     def draw_ellipse(self, center: Tuple[float, float, float],
                      major_axis: float, minor_axis: float, rotation: float = 0,
                      layer: str = None, color: int = None, lineweight=None) -> Optional[str]:
-        """绘制椭圆"""
+        """타원 그리기"""
         if not self.is_running():
             return None
 
@@ -534,10 +534,10 @@ class CADController:
             if rotation is None:
                 rotation = 0
 
-            # 将旋转角度转换为弧度
+            # 회전각을 라디안으로 변환
             rotation_rad = math.radians(rotation)
 
-            # 计算椭圆的主轴向量
+            # 타원 장축 벡터 계산
             major_x = major_axis * math.cos(rotation_rad)
             major_y = major_axis * math.sin(rotation_rad)
 
@@ -548,13 +548,13 @@ class CADController:
 
             self._apply_style(ellipse, layer, color, lineweight)
 
-            # 刷新视图
+            # 뷰 갱신
             self.refresh_view()
 
-            logger.debug(f"已绘制椭圆: 中心{center}, 长轴{major_axis}, 短轴{minor_axis}, 旋转角度{rotation}, 图层{layer if layer else '默认'}, 颜色{color if color is not None else '默认'}")
+            logger.debug(f"타원 그리기 완료: 중심{center}, 장축{major_axis}, 단축{minor_axis}, 회전각{rotation}, 레이어{layer if layer else '기본값'}, 색상{color if color is not None else '기본값'}")
             return self._handle_of(ellipse)
         except Exception as e:
-            logger.error(f"绘制椭圆失败: {str(e)}")
+            logger.error(f"타원 그리기 실패: {str(e)}")
             return None
 
     def _add_polyline(self, normalized: List[Tuple[float, float, float]]) -> Any:
@@ -602,14 +602,14 @@ class CADController:
             return None
 
         try:
-            # 确保所有点都是三维的
+            # 모든 점을 3차원으로 정규화
             processed_points = [self._normalize(p) for p in points]
 
             polyline = self._add_polyline(processed_points)
             if polyline is None:
                 return None
 
-            # 如果需要闭合
+            # 닫힘 처리가 필요한 경우
             if closed and len(processed_points) > 2:
                 try:
                     polyline.Closed = True
@@ -618,26 +618,26 @@ class CADController:
 
             self._apply_style(polyline, layer, color, lineweight)
 
-            # 刷新视图
+            # 뷰 갱신
             self.refresh_view()
 
-            logger.debug(f"已绘制多段线: {len(points)}个点, {'闭合' if closed else '不闭合'}, 图层{layer if layer else '默认'}, 颜色{color if color is not None else '默认'}")
+            logger.debug(f"폴리라인 그리기 완료: {len(points)}개 점, {'닫힘' if closed else '열림'}, 레이어{layer if layer else '기본값'}, 색상{color if color is not None else '기본값'}")
             return polyline
         except Exception as e:
-            logger.error(f"绘制多段线时出错: {str(e)}")
+            logger.error(f"폴리라인 그리기 중 오류 발생: {str(e)}")
             return None
 
     def draw_polyline(self, points: List[Tuple[float, float, float]],
                       closed: bool = False, layer: str = None,
                       color: int = None, lineweight=None) -> Optional[str]:
-        """绘制多段线"""
+        """폴리라인 그리기"""
         entity = self._make_polyline(points, closed, layer, color, lineweight)
         return self._handle_of(entity)
 
     def draw_rectangle(self, corner1: Tuple[float, float, float],
                        corner2: Tuple[float, float, float], layer: str = None,
                        color: int = None, lineweight=None) -> Optional[str]:
-        """绘制矩形"""
+        """직사각형 그리기"""
         if not self.is_running():
             return None
 
@@ -645,29 +645,29 @@ class CADController:
             corner1 = self._normalize(corner1)
             corner2 = self._normalize(corner2)
 
-            # 计算矩形的四个角点
+            # 직사각형의 네 꼭짓점 계산
             x1, y1, z1 = corner1
             x2, y2, z2 = corner2
 
-            # 创建矩形的四个点
+            # 직사각형의 네 점 생성
             points = [
                 (x1, y1, z1),
                 (x2, y1, z1),
                 (x2, y2, z1),
                 (x1, y2, z1),
-                (x1, y1, z1)  # 闭合矩形
+                (x1, y1, z1)  # 직사각형 닫기
             ]
 
-            # 使用多段线绘制矩形
+            # 폴리라인으로 직사각형 그리기
             return self.draw_polyline(points, True, layer, color, lineweight)
         except Exception as e:
-            logger.error(f"绘制矩形时出错: {str(e)}")
+            logger.error(f"직사각형 그리기 중 오류 발생: {str(e)}")
             return None
 
     def draw_text(self, position: Tuple[float, float, float],
                   text: str, height: float = 2.5, rotation: float = 0,
                   layer: str = None, color: int = None) -> Optional[str]:
-        """添加文本"""
+        """텍스트 추가"""
         if not self.is_running():
             return None
 
@@ -678,7 +678,7 @@ class CADController:
             text_obj = self.doc.ModelSpace.AddText(
                 text, self._pt(position), float(height))
 
-            # 设置旋转角度
+            # 회전각 설정
             if rotation:
                 try:
                     text_obj.Rotation = math.radians(rotation)
@@ -687,13 +687,13 @@ class CADController:
 
             self._apply_style(text_obj, layer, color, None)
 
-            # 刷新视图
+            # 뷰 갱신
             self.refresh_view()
 
-            logger.debug(f"已添加文本: '{text}', 位置{position}, 高度{height}, 旋转{rotation}度, 图层{layer if layer else '默认'}, 颜色{color if color is not None else '默认'}")
+            logger.debug(f"텍스트 추가 완료: '{text}', 위치{position}, 높이{height}, 회전{rotation}도, 레이어{layer if layer else '기본값'}, 색상{color if color is not None else '기본값'}")
             return self._handle_of(text_obj)
         except Exception as e:
-            logger.error(f"添加文本时出错: {str(e)}")
+            logger.error(f"텍스트 추가 중 오류 발생: {str(e)}")
             return None
 
     def _try_delete(self, entity: Any) -> None:
@@ -797,45 +797,45 @@ class CADController:
     def draw_hatch(self, points: List[Tuple[float, float, float]],
                    pattern_name: str = "SOLID", scale: float = 1.0,
                    layer: str = None, color: int = None) -> Optional[str]:
-        """绘制填充图案
+        """해치(채우기 패턴) 그리기
 
         Args:
-            points: 填充边界的点集，每个点为二维或三维坐标元组
-            pattern_name: 填充图案名称，默认为"SOLID"(实体填充)
-            scale: 填充图案比例，默认为1.0
-            layer: 图层名称，如果为None则使用当前图层
-            color: 颜色索引，如果为None则使用默认颜色
+            points: 해치 경계를 이루는 점 목록. 각 점은 2차원 또는 3차원 좌표 튜플
+            pattern_name: 해치 패턴 이름, 기본값은 "SOLID"(단색 채우기)
+            scale: 해치 패턴 비율, 기본값은 1.0
+            layer: 레이어 이름, None이면 현재 레이어 사용
+            color: 색상 인덱스, None이면 기본 색상 사용
 
         Returns:
-            成功返回填充对象，失败返回None
+            성공 시 해치 객체의 핸들, 실패 시 None
         """
         if not self.is_running():
             return None
 
         try:
-            # 确保所有点都是有效的
+            # 모든 점이 유효한지 확인
             if not points or len(points) < 3:
-                logger.error("创建填充失败: 至少需要3个点来定义填充边界")
+                logger.error("해치 생성 실패: 경계를 정의하려면 최소 3개의 점이 필요합니다")
                 return None
 
-            # 创建闭合多段线作为边界 (경계 COM 객체 자체가 필요하므로 _make_polyline 사용)
+            # 경계로 사용할 닫힌 폴리라인 생성 (경계 COM 객체 자체가 필요하므로 _make_polyline 사용)
             closed_polyline = self._make_polyline(points, closed=True, layer=layer)
             if not closed_polyline:
-                logger.error("创建填充失败: 无法创建边界多段线")
+                logger.error("해치 생성 실패: 경계 폴리라인을 만들 수 없습니다")
                 return None
 
-            # 创建填充对象 (关联边界)
+            # 해치 객체 생성 (경계와 연결)
             hatch = self._create_hatch(pattern_name)
             if hatch is None:
                 self._try_delete(closed_polyline)
                 return None
 
-            # 添加外部边界循环
+            # 외부 경계 루프 추가
             if not self._append_outer_loop(hatch, closed_polyline):
                 self._try_delete(hatch)
                 return None
 
-            # 设置填充图案比例
+            # 해치 패턴 비율 설정
             try:
                 hatch.PatternScale = scale
             except Exception as e:
@@ -843,7 +843,7 @@ class CADController:
 
             self._apply_style(hatch, layer, color, None)
 
-            # 更新填充 (计算填充区域)
+            # 해치 갱신 (채우기 영역 계산)
             # AutoCAD는 Evaluate, IntelliCAD 계열은 Update를 쓴다
             refreshed = False
             for name in ("Evaluate", "Update", "Regen"):
@@ -860,41 +860,41 @@ class CADController:
             if not refreshed:
                 logger.debug("해치 갱신 메서드 없음 (자동 계산되는 구현으로 판단)")
 
-            # 刷新视图
+            # 뷰 갱신
             self.refresh_view()
 
-            logger.debug(f"已创建填充: 图案 {pattern_name}, 比例 {scale}, 图层{layer if layer else '默认'}, 颜色{color if color is not None else '默认'}")
+            logger.debug(f"해치 생성 완료: 패턴 {pattern_name}, 비율 {scale}, 레이어{layer if layer else '기본값'}, 색상{color if color is not None else '기본값'}")
             return self._handle_of(hatch)
         except Exception as e:
-            logger.error(f"创建填充时出错: {str(e)}")
+            logger.error(f"해치 생성 중 오류 발생: {str(e)}")
             return None
 
     def zoom_extents(self) -> bool:
-        """缩放视图以显示所有对象"""
+        """모든 객체가 보이도록 뷰 확대/축소"""
         if not self.is_running():
             return False
 
         # CAD별로 진입점이 달라 순차 시도
         try:
             self.doc.ActiveViewport.ZoomExtents()
-            logger.info("已缩放视图以显示所有对象")
+            logger.info("모든 객체가 보이도록 뷰를 확대/축소했습니다")
             return True
         except Exception as e1:
             try:
                 self.app.ZoomExtents()
-                logger.info("已缩放视图以显示所有对象 (Application.ZoomExtents)")
+                logger.info("모든 객체가 보이도록 뷰를 확대/축소했습니다 (Application.ZoomExtents)")
                 return True
             except Exception as e2:
                 if self._send_command("_ZOOM\n_E\n"):
-                    logger.info("已缩放视图以显示所有对象 (SendCommand)")
+                    logger.info("모든 객체가 보이도록 뷰를 확대/축소했습니다 (SendCommand)")
                     return True
-                logger.error(f"缩放视图时出错: {e1} / {e2}")
+                logger.error(f"뷰 확대/축소 중 오류 발생: {e1} / {e2}")
                 return False
 
     def close(self) -> None:
-        """关闭CAD控制器"""
+        """CAD 컨트롤러 종료"""
         try:
-            # 释放COM资源
+            # COM 리소스 해제
             if self.app is not None:
                 del self.app
             pythoncom.CoUninitialize()
@@ -902,13 +902,13 @@ class CADController:
             pass
 
     def create_layer(self, layer_name: str) -> bool:    # , color: Union[int, Tuple[int, int, int]] = 7
-        """创建新图层
+        """새 레이어 생성
 
         Args:
-            layer_name: 图层名称
+            layer_name: 레이어 이름
 
         Returns:
-            操作是否成功
+            작업 성공 여부
         """
         if not self.is_running():
             return False
@@ -945,15 +945,15 @@ class CADController:
                 except Exception:
                     pass
 
-            # 创建新图层
+            # 새 레이어 생성
             new_layer = self.doc.Layers.Add(layer_name)
 
-            # 设置为当前图层
+            # 현재 레이어로 설정
             self.doc.ActiveLayer = new_layer
-            logger.info(f"已创建新图层: {layer_name}")
+            logger.info(f"새 레이어 생성 완료: {layer_name}")
             return True
         except Exception as e:
-            logger.error(f"创建图层时出错: {str(e)}")
+            logger.error(f"레이어 생성 중 오류 발생: {str(e)}")
             return False
 
     def add_dimension(self, start_point: Tuple[float, float, float],
@@ -961,7 +961,7 @@ class CADController:
                       text_position: Tuple[float, float, float] = None,
                       textheight: float = 5, layer: str = None,
                       color: int = None) -> Optional[str]:
-        """添加线性标注"""
+        """선형 치수 추가"""
         if not self.is_running():
             return None
 
@@ -969,19 +969,19 @@ class CADController:
             start_point = self._normalize(start_point)
             end_point = self._normalize(end_point)
 
-            # 如果未提供文本位置，自动计算
+            # 텍스트 위치가 제공되지 않으면 자동으로 계산
             if text_position is None:
-                # 在起点和终点之间的中点上方
+                # 시작점과 끝점 사이 중점 위쪽
                 mid_x = (start_point[0] + end_point[0]) / 2
                 mid_y = (start_point[1] + end_point[1]) / 2
                 text_position = (mid_x, mid_y + 5, 0)
             text_position = self._normalize(text_position)
 
-            # 添加对齐标注
+            # 정렬 치수 추가
             dimension = self.doc.ModelSpace.AddDimAligned(
                 self._pt(start_point), self._pt(end_point), self._pt(text_position))
 
-            # 设置文字高度
+            # 문자 높이 설정
             if textheight is not None:
                 try:
                     dimension.TextHeight = textheight
@@ -990,13 +990,13 @@ class CADController:
 
             self._apply_style(dimension, layer, color, None)
 
-            # 刷新视图
+            # 뷰 갱신
             self.refresh_view()
 
-            logger.info(f"已添加标注: 从 {start_point} 到 {end_point}, 图层{layer if layer else '默认'}")
+            logger.info(f"치수 추가 완료: {start_point}에서 {end_point}까지, 레이어{layer if layer else '기본값'}")
             return self._handle_of(dimension)
         except Exception as e:
-            logger.error(f"添加标注时出错: {str(e)}")
+            logger.error(f"치수 추가 중 오류 발생: {str(e)}")
             return None
 
     # ==================================================================
