@@ -144,6 +144,13 @@ int, list/dict of primitives)만 허용**한다. 살아있는 COM 객체가 필�
 
 ### 연결 관리
 `cad_reconnect` — 막힌 COM 연결을 버리고 재연결(위 "절대 규칙" 참고).
+`CADWorker.restart()`로 작업 스레드만 교체하는 게 아니라, 그 직후
+`start_cad()`를 직접 호출해 실제로 캐디안에 재연결까지 시도한 뒤 상태를
+반환한다 — 그냥 `restart()` + `health_check()`만 하면 새로 만든 컨트롤러가
+아직 아무 것도 안 한 상태라 항상 `document: "not_connected"`만 나온다
+(2026-09-06에 실제로 6회 연속 재현 확인). `cad_status`는 의도적으로 이
+얕은 확인만 한다 — 멈춰 있는 상황에서도 안전하게 즉시 반환해야 하니
+`start_cad()` 같은 새 COM 호출을 걸지 않는다. 이 차이를 헷갈리지 말 것.
 
 ### 기타
 `save_drawing`(저장 전 `zoom_extents` 자동 호출), `process_command`(자연어

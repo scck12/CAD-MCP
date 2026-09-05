@@ -127,8 +127,22 @@ class CADService:
         return self.worker.health_check()
 
     def reconnect(self):
-        """막힌 COM 연결을 버리고 새로 연결"""
+        """막힌 COM 연결을 버리고 새로 연결
+
+        restart()는 새 작업 스레드로 교체할 뿐 실제로 캐디안에 다시
+        붙지는 않는다. health_check()의 probe는 is_running()만 보고
+        start_cad()를 호출하지 않으므로, 여기서 부르지 않으면
+        재연결 직후의 health_check는 항상 document: "not_connected"만
+        보고한다(실제 재연결 성공 여부와 무관하게) - 이러면 재연결이
+        실패한 것처럼 보이는 오해를 산다. 그래서 restart 직후 이 자리에서
+        직접 start_cad()를 시도해 실제 연결 결과가 반영되게 한다.
+        """
         self.worker.restart()
+        try:
+            self.worker.run(lambda c: c.start_cad(),
+                            timeout=cad_worker.CONNECT_TIMEOUT)
+        except Exception as e:
+            logger.warning(f"재연결 중 start_cad 실패: {e}")
         return self.worker.health_check(timeout=cad_worker.CONNECT_TIMEOUT)
     
     def draw_line(self, start_point, end_point, layer=None, color=None, lineweight=None):

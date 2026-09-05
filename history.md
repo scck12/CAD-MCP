@@ -221,3 +221,68 @@ cad_controller.py, nlp_processor.py 각각 1개). `__init__.py`는 짧아서 직
   도구 설명이 갱신되지 않았다(소스 코드 자체는 확인 결과 정상 번역됨).
   MCP 서버 재연결/앱 재시작이 필요한 이미 알려진 제약(`spec.md` "검증
   방법" 참고)과 동일한 현상.
+
+## 2026-09-06 — "scale이 서버를 죽였다 / draw_arc가 타임아웃됐다" 제보 조사
+
+**제보**: 실제 도면 작업 세션에서 `edit_entity`의 scale이 서버를 멈추게
+했고 `draw_arc`가 타임아웃됐다고 보고됨. delete(24회)·draw_polyline·
+draw_rectangle(20회)은 한 번도 실패하지 않았다는 대비가 단서로 제시됨.
+
+**1차 조사 (코드/재현)**: 라이브 도면에서 line/polyline/text/dimension/
+hatch 5종 엔티티에 rotate/scale 직접 호출 → 전부 즉시 정상. 별도의 격리된
+새 CADian 인스턴스(`DispatchEx`로 강제 새 프로세스, 기존 작업 문서는
+안 건드림)에서 `draw_arc` 9개 엣지 케이스(역순 각도, 360도 초과, 반지름
+0/음수/극단값 등)와 `scale_entity` 5개 엣지 케이스(factor 0/음수/극단값),
+블록 인스턴스 rotate/scale까지 순차 재현 → 전부 0.3초 이내 정상(음수
+반지름만 CADian이 즉시 예외로 거부 — 이미 안전하게 처리되는 정상 동작).
+`edit_entity`의 7개 연산 전부 동일한 `ControllerProxy` →
+`CADWorker.run()` 45초 타임아웃 경로를 거치므로 연산별 코드 차이도 없음.
+
+**로그 분석**: `cad_mcp.log` 전체 이력에 CADBusy(45초 타임아웃) 에러가
+단 한 번도 없었음. 반면 이 세션(Claude Code) 작업자가 직접 재시작한
+것보다 훨씬 많은 서버 재시작이 로그에 있었음 — 다른 원인(다른 세션의
+재연결 시도, 앱 자체의 동작 등)으로 서버 프로세스가 재시작되는 순간과
+그 세션의 호출 타이밍이 겹쳐 "서버가 죽었다/타임아웃됐다"로 보였을
+가능성이 1차 결론.
+
+**사용자 반박 및 2차 가설**: 장애 당시 `cad_reconnect`가 2회 실행됐고
+그중 1회가 `document: "not_connected"`를 반환한 것이 단서로 제시됨.
+"`cad_reconnect`가 새 스레드를 띄우며 이전 COM 프록시를 정리하지 않아
+이후 호출이 죽은 프록시를 잡고 무한 대기한다"는 가설(RPC_E_WRONG_THREAD와
+같은 뿌리)이 제기됨.
+
+**2차 검증**: 라이브 서버에서 `cad_reconnect`를 3회 연속 호출한 직후
+scale을 시도(1회), 별도로 3회 연속 재연결 직후 draw_arc를 시도(1회) —
+총 6회 반복. 매번 재연결 포함 2초 이내 정상 처리, 행 없음(로그 타임스탬프
+실측: 00:51:29,747 재연결 시작 → 00:51:31,904 scale 완료). **스레드 간
+COM 객체 공유 자체가 코드 구조상 불가능**함도 확인 — `CADWorker._loop`가
+매번 새 스레드 안에서 자기만의 `CADController` 지역 변수를 만들고,
+`ControllerProxy`는 항상 "현재" 워커 스레드에만 작업을 넘기므로 이전
+스레드의 컨트롤러가 이후 호출에 섞여 들어갈 경로가 없음. 가설 재현 실패.
+
+**그런데 실제로 다른 버그를 하나 발견함**: `CADWorker.health_check()`의
+`probe`는 `controller.is_running()`만 확인하고 `start_cad()`는 호출하지
+않는다. `restart()` 직후의 컨트롤러는 항상 비어 있는 새 상태이므로,
+`cad_reconnect`(`restart()` + `health_check()`)는 **실제 재연결
+성공/실패와 무관하게 항상 `document: "not_connected"`를 반환**한다 —
+사용자가 관찰한 그 현상이 정확히 이것이었다. 재현: 라이브 서버에서
+`cad_reconnect`를 6회 호출, 매번 `not_connected` 확인. 이건 행(hang)이
+아니라 "재연결했다고 보고하지만 실제로는 재연결 시도조차 안 하는" 상태
+보고 버그.
+
+**수정**: `CADService.reconnect()`(`server.py`)가 `restart()` 직후
+`worker.run(lambda c: c.start_cad(), timeout=CONNECT_TIMEOUT)`을 직접
+호출해 실제 재연결을 시도한 뒤 `health_check()`를 반환하도록 변경.
+`cad_status`(단순 상태 확인)는 의도적으로 그대로 둠 — 멈춘 상황에서도
+안전하게 즉시 반환해야 하니 새 COM 호출을 걸면 안 됨.
+
+**검증**: 서버 재시작 후 `cad_reconnect`를 3회 연속 호출 → 매번
+`document: "step2.dwg"`로 정확히 보고되는 것을 확인(이전엔 매번
+`not_connected`였음). 실제 작업 도면(엔티티 337개로 계속 진행 중)에는
+영향 없음을 `get_drawing_info`로 확인.
+
+**최종 결론**: scale/draw_arc 자체에는 버그가 없고(코드 경로 동일, 광범위
+edge case 재현 실패), 사용자가 단서로 제시한 stale-proxy 가설도 재현 실패.
+다만 조사 과정에서 `cad_reconnect`의 "not_connected 오보고" 버그를 찾아
+수정함 — 원래 제보(서버가 죽었다/타임아웃)에 대한 직접 증거는 아니지만,
+향후 재연결 후 상태 판단에 혼란을 줄 수 있었던 실제 결함.
