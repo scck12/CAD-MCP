@@ -1,28 +1,52 @@
-import os
-import sys
+r"""CAD MCP 서버 진입점.
+
+구조
+    MCP 요청(비동기) -> 도구 핸들러(별도 스레드, asyncio.to_thread)
+                     -> CADService.run() -> CADWorker 작업 큐 -> COM (작업 스레드)
+
+    핸들러를 이벤트 루프 밖 스레드에서 돌리는 이유: 예전에는 핸들러가 이벤트
+    루프 위에서 COM 응답을 동기로 기다려, 한 호출이 막히면 그동안 cad_status
+    같은 다른 요청도 전혀 처리되지 않았다 (개선 요청 2-2).
+
+    모든 호출에는 두 겹의 시간 제한이 있다.
+      1) 작업 스레드 제한: 도구별 30~120초 (cad_worker)
+      2) 서버 전체 상한: HARD_TIMEOUT초 — 미리보기 렌더링처럼 작업 스레드
+         밖에서 일어나는 일까지 포함
+    어느 쪽이든 넘기면 구조화된 오류를 돌려주고 서버는 계속 산다.
+
+진단 장치
+    - 도구 호출마다 시작/종료(소요 시간)를 cad_mcp.log에 남긴다. 서버가 죽으면
+      마지막 "시작"만 있고 "종료"가 없는 줄이 범인이다.
+    - 네이티브 크래시(COM 내부 접근 위반 등)는 파이썬 로그에 안 남으므로
+      faulthandler로 cad_mcp_crash.log에 스택을 덤프한다.
+"""
+import asyncio
+import base64
+import faulthandler
 import json
 import logging
-from pathlib import Path
-from mcp.server.models import InitializationOptions
-import mcp.types as types
-from mcp.server import NotificationOptions, Server
-import mcp.server.stdio
-from pydantic import AnyUrl
-from typing import Any, Dict, List
+import logging.handlers
+import os
 import sys
+import threading
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 sys.dont_write_bytecode = True
 
-# 절대 임포트 사용
+import mcp.server.stdio  # noqa: E402
+import mcp.types as types  # noqa: E402
+from mcp.server import NotificationOptions, Server  # noqa: E402
+from mcp.server.models import InitializationOptions  # noqa: E402
+from pydantic import AnyUrl  # noqa: E402
 
-from nlp_processor import NLPProcessor
+import cad_reader  # noqa: E402
+import cad_worker  # noqa: E402
+from cad_controller import CADError, describe_error  # noqa: E402
+from cad_worker import CADBusy, CONNECT_TIMEOUT, DEFAULT_TIMEOUT, LONG_TIMEOUT  # noqa: E402
 
-from cad_controller import CADController
-# 도면 읽기 / 미리보기 렌더링
-import base64
-import cad_reader
-import cad_worker
-
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+HARD_TIMEOUT = 280.0
 
 # Windows 환경에서 UTF-8 인코딩 설정
 if sys.platform == "win32" and os.environ.get('PYTHONIOENCODING') is None:
@@ -30,1873 +54,847 @@ if sys.platform == "win32" and os.environ.get('PYTHONIOENCODING') is None:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-# 로그 설정
+_file_handler = logging.handlers.RotatingFileHandler(
+    os.path.join(SRC_DIR, 'cad_mcp.log'), maxBytes=2 * 1024 * 1024,
+    backupCount=3, encoding='utf-8')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(
-			os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cad_mcp.log'), encoding='utf-8'
-		)
-    ]
-)
-
-
+    handlers=[logging.StreamHandler(), _file_handler])
 logger = logging.getLogger('mcp_cad_server')
-logger.info("CAD MCP 서버 시작")
+
+# 네이티브 크래시 덤프 (파일 핸들은 프로세스 끝까지 열어 둔다)
+_crash_file = open(os.path.join(SRC_DIR, 'cad_mcp_crash.log'), 'a', encoding='utf-8')
+_crash_file.write(f"\n===== 서버 시작 {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} =====\n")
+_crash_file.flush()
+faulthandler.enable(file=_crash_file, all_threads=True)
 
 
-PROMPT_TEMPLATE = """
-어시스턴트의 목표는 CAD MCP 서비스 사용법을 시연하는 것이다. 이 서비스를 통해 대화 안에서 바로 CAD 소프트웨어를 제어하여 도형을 만들고 수정할 수 있다.
+def _log_uncaught(exc_type, exc, tb):
+    logger.critical("처리되지 않은 예외", exc_info=(exc_type, exc, tb))
 
-<cad-mcp>
 
-프롬프트:
-이 서버는 "cad-assistant"라는 이름의 사전 정의된 프롬프트를 제공하여, 사용자가 자연어 명령으로 CAD를 제어하도록 돕는다. 사용자는 다양한 도형을 그리거나, 도형 요소를 수정하거나, 도면을 저장하도록 요청할 수 있다.
+def _log_thread_uncaught(args):
+    logger.critical(f"스레드 '{args.thread.name if args.thread else '?'}' 처리되지 않은 예외",
+                    exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
 
-리소스:
-이 서버는 현재 CAD 도면 상태를 나타내는 "drawing://current" 리소스를 제공한다.
 
-도구:
+sys.excepthook = _log_uncaught
+threading.excepthook = _log_thread_uncaught
 
-이 서버는 다음과 같은 기본 작도 도구를 제공한다:
-"draw_line": CAD에서 직선을 그린다
-"draw_circle": CAD에서 원을 그린다
-"draw_arc": CAD에서 호를 그린다
-"draw_ellipse": CAD에서 타원을 그린다
-"draw_polyline": CAD에서 폴리라인을 그린다
-"draw_rectangle": CAD에서 사각형을 그린다
-"draw_text": CAD에 텍스트를 추가한다
-"draw_hatch": CAD에서 해치(채우기)를 그린다
-"save_drawing": 현재 도면을 저장한다
-"add_dimension": CAD에 선형 치수를 추가한다
-"process_command": 자연어 명령을 처리하여 CAD 작업으로 변환한다
+with open(os.path.join(SRC_DIR, 'config.json'), 'r', encoding='utf-8') as _f:
+    CONFIG = json.load(_f)
 
-</cad-mcp>
 
-친근한 방식으로 시연을 시작하라. 예: "안녕하세요! 오늘은 CAD MCP 서비스 사용법을 보여드리겠습니다. 이 서비스를 이용하면 화면을 직접 조작하지 않고도 대화 안에서 바로 CAD 소프트웨어를 제어할 수 있습니다. 시작해 볼까요!"
-"""
+def _dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
 
-# 추후 구현 예정
-# "erase_entity": 지정한 엔티티 삭제
-# "move_entity": 지정한 엔티티 이동
-# "rotate_entity": 지정한 엔티티 회전
-# "scale_entity": 지정한 엔티티 축척 조정
 
-class Config:
-
-    def __init__(self):
-        # config.json 파일을 직접 읽는다
-        config_path = os.path.join(os.path.dirname(__file__), 'config.json')
-        with open(config_path, 'r', encoding='utf-8') as f:
-            self.config = json.load(f)
-        logger.info("설정 파일 로드 성공")
-
-    @property
-    def server_name(self) -> str:
-        return self.config['server']['name']
-
-    @property
-    def server_version(self) -> str:
-        return self.config['server']['version']
+# ======================================================================
+# 서비스
+# ======================================================================
 
 class CADService:
     def __init__(self):
-        """CAD 서비스 초기화"""
-        # COM 호출은 전용 스레드에서 실행한다. 캐디안이 멈춰도 MCP 서버는
-        # 계속 응답하고, 타임아웃 시 Claude에게 상황을 알릴 수 있다.
         self.worker = cad_worker.CADWorker()
-        self.controller = cad_worker.ControllerProxy(self.worker)
-        self.nlp_processor = NLPProcessor()
-        self.drawing_state = {
-            "entities": [],
-            "current_layer": "0",
-            "last_command": "",
-            "last_result": ""
-        }
-        logger.info("CAD 서비스 초기화 완료 (COM 전용 스레드)")
+        self.state = {"last_command": "", "last_result": ""}
 
-    def start_cad(self):
-        """CAD 시작"""
-        return self.worker.run(lambda c: c.start_cad(),
-                               timeout=cad_worker.CONNECT_TIMEOUT)
+    def run(self, fn: Callable, label: str, timeout: float = None,
+            mutating: bool = False) -> Any:
+        """작업 스레드에서 fn(controller) 실행
 
-    def cad_status(self):
-        """CAD 연결 상태 점검 (막혀 있어도 빠르게 반환)"""
-        return self.worker.health_check()
-
-    def reconnect(self):
-        """막힌 COM 연결을 버리고 새로 연결
-
-        restart()는 새 작업 스레드로 교체할 뿐 실제로 캐디안에 다시
-        붙지는 않는다. health_check()의 probe는 is_running()만 보고
-        start_cad()를 호출하지 않으므로, 여기서 부르지 않으면
-        재연결 직후의 health_check는 항상 document: "not_connected"만
-        보고한다(실제 재연결 성공 여부와 무관하게) - 이러면 재연결이
-        실패한 것처럼 보이는 오해를 산다. 그래서 restart 직후 이 자리에서
-        직접 start_cad()를 시도해 실제 연결 결과가 반영되게 한다.
+        mutating이면 실행 취소 표시(StartUndoMark/EndUndoMark)로 감싸서, undo
+        1단계가 도구 호출 1번을 정확히 되돌리게 한다.
         """
+        def job(c):
+            if mutating:
+                c.begin_undo()
+            try:
+                return fn(c)
+            finally:
+                if mutating:
+                    c.end_undo()
+
+        self.state["last_command"] = label
+        try:
+            result = self.worker.run(job, timeout=timeout, label=label)
+            self.state["last_result"] = "성공"
+            return result
+        except Exception as e:
+            self.state["last_result"] = f"실패: {describe_error(e)}"
+            raise
+
+    def status(self) -> Dict[str, Any]:
+        info = self.worker.status()
+        # 연결돼 있고 한가할 때만 가볍게 확인한다 (활성 문서 동기화 포함).
+        # 연결이 없을 때 확인하려 들면 캐디안을 띄워 버릴 수 있어 하지 않는다.
+        if info.get("state") == "ready":
+            try:
+                self.worker.run(lambda c: c.doc_name, timeout=10.0, label="상태 확인")
+                info = self.worker.status()
+                info["probe"] = "ok"
+            except Exception as e:
+                info = self.worker.status()
+                info["probe"] = describe_error(e)
+        return info
+
+    def reconnect(self) -> Dict[str, Any]:
+        """작업 스레드를 새로 만들고 실제로 캐디안에 다시 붙는다"""
         self.worker.restart()
         try:
-            self.worker.run(lambda c: c.start_cad(),
-                            timeout=cad_worker.CONNECT_TIMEOUT)
+            self.worker.run(lambda c: c.doc_name, timeout=CONNECT_TIMEOUT, label="재연결")
         except Exception as e:
-            logger.warning(f"재연결 중 start_cad 실패: {e}")
-        return self.worker.health_check(timeout=cad_worker.CONNECT_TIMEOUT)
-    
-    def draw_line(self, start_point, end_point, layer=None, color=None, lineweight=None):
-        """직선 그리기"""
-        if not self.controller.is_running():
-            self.start_cad()
-        
-        # 현재 레이어 또는 지정된 레이어 사용
-        current_layer = layer or self.drawing_state["current_layer"]
-        
-        result = self.controller.draw_line(start_point, end_point, current_layer, color, lineweight)
-        if result:
-            self.drawing_state["entities"].append({
-                "type": "line",
-                "start": start_point,
-                "end": end_point,
-                "layer": current_layer,
-                "color": color,
-                "lineweight": lineweight
-            })
-            self.drawing_state["last_command"] = f"{start_point}에서 {end_point}까지 직선 그리기"
-            self.drawing_state["last_result"] = "성공"
-        else:
-            self.drawing_state["last_result"] = "실패"
-
-        return result
-
-    def draw_circle(self, center, radius, layer=None, color=None, lineweight=None):
-        """원 그리기"""
-        if not self.controller.is_running():
-            self.start_cad()
-        
-        # 현재 레이어 또는 지정된 레이어 사용
-        current_layer = layer or self.drawing_state["current_layer"]
-        
-        result = self.controller.draw_circle(center, radius, current_layer, color, lineweight)
-        if result:
-            self.drawing_state["entities"].append({
-                "type": "circle",
-                "center": center,
-                "radius": radius,
-                "layer": current_layer,
-                "color": color,
-                "lineweight": lineweight
-            })
-            self.drawing_state["last_command"] = f"원 그리기, 중심점{center}, 반지름{radius}, 레이어{current_layer}"
-            self.drawing_state["last_result"] = "성공"
-        else:
-            self.drawing_state["last_result"] = "실패"
-
-        return result
-
-    def draw_arc(self, center, radius, start_angle, end_angle, layer=None, color=None, lineweight=None):
-        """호 그리기"""
-        if not self.controller.is_running():
-            self.start_cad()
-        
-        # 현재 레이어 또는 지정된 레이어 사용
-        current_layer = layer or self.drawing_state["current_layer"]
-        
-        result = self.controller.draw_arc(center, radius, start_angle, end_angle, current_layer, color, lineweight)
-
-        if result:
-            self.drawing_state["entities"].append({
-                "type": "arc",
-                "center": center,
-                "radius": radius,
-                "start_angle": start_angle,
-                "end_angle": end_angle,
-                "layer": current_layer,
-                "color": color,
-                "lineweight": lineweight
-            })
-            self.drawing_state["last_command"] = f"호 그리기, 중심점{center}, 반지름{radius}, 시작각도{start_angle}, 끝각도{end_angle}, 레이어{current_layer}"
-            self.drawing_state["last_result"] = "성공"
-        else:
-            self.drawing_state["last_result"] = "실패"
-
-        return result
-
-    def draw_ellipse(self, center, major_axis, minor_axis, rotation=0, layer=None, color=None, lineweight=None):
-        """타원 그리기"""
-        if not self.controller.is_running():
-            self.start_cad()
-        
-        # 현재 레이어 또는 지정된 레이어 사용
-        current_layer = layer or self.drawing_state["current_layer"]
-        
-        result = self.controller.draw_ellipse(center, major_axis, minor_axis, rotation, current_layer, color, lineweight)
-
-        if result:
-            self.drawing_state["entities"].append({
-                "type": "ellipse",
-                "center": center,
-                "major_axis": major_axis,
-                "minor_axis": minor_axis,
-                "rotation": rotation,
-                "layer": current_layer,
-                "color": color,
-                "lineweight": lineweight
-            })
-            self.drawing_state["last_command"] = f"타원 그리기, 중심점{center}, 장축{major_axis}, 단축{minor_axis}, 회전각도{rotation}, 레이어{current_layer}"
-            self.drawing_state["last_result"] = "성공"
-        else:
-            self.drawing_state["last_result"] = "실패"
-
-        return result
-
-    def draw_polyline(self, points, closed=False, layer=None, color=None, lineweight=None):
-        """폴리라인 그리기"""
-        if not self.controller.is_running():
-            self.start_cad()
-        
-        # 현재 레이어 또는 지정된 레이어 사용
-        current_layer = layer or self.drawing_state["current_layer"]
-        
-        result = self.controller.draw_polyline(points, closed, current_layer, color, lineweight)
-        if result:
-            self.drawing_state["entities"].append({
-                "type": "polyline",
-                "points": points,
-                "closed": closed,
-                "layer": current_layer,
-                "color": color,
-                "lineweight": lineweight
-            })
-            self.drawing_state["last_command"] = f"폴리라인 그리기, 점집합{points}, {'닫힘' if closed else '열림'}, 레이어{current_layer}"
-            self.drawing_state["last_result"] = "성공"
-        else:
-            self.drawing_state["last_result"] = "실패"
-
-        return result
-
-    def draw_rectangle(self, corner1, corner2, layer=None, color=None, lineweight=None):
-        """사각형 그리기"""
-        if not self.controller.is_running():
-            self.start_cad()
-        
-        # 현재 레이어 또는 지정된 레이어 사용
-        current_layer = layer or self.drawing_state["current_layer"]
-        
-        result = self.controller.draw_rectangle(corner1, corner2, current_layer, color, lineweight)
-        if result:
-            self.drawing_state["entities"].append({
-                "type": "rectangle",
-                "corner1": corner1,
-                "corner2": corner2,
-                "layer": current_layer,
-                "color": color,
-                "lineweight": lineweight
-            })
-            self.drawing_state["last_command"] = f"사각형 그리기, 대각점{corner1}와 {corner2}, 레이어{current_layer}"
-            self.drawing_state["last_result"] = "성공"
-        else:
-            self.drawing_state["last_result"] = "실패"
-
-        return result
-
-    def draw_text(self, position, text, height=2.5, rotation=0, layer=None, color=None):
-        """텍스트 추가"""
-        if not self.controller.is_running():
-            self.start_cad()
-        
-        # 현재 레이어 또는 지정된 레이어 사용
-        current_layer = layer or self.drawing_state["current_layer"]
-        
-        result = self.controller.draw_text(position, text, height, rotation, current_layer, color)
-        if result:
-            self.drawing_state["entities"].append({
-                "type": "text",
-                "position": position,
-                "text": text,
-                "height": height,
-                "rotation": rotation,
-                "layer": current_layer,
-                "color": color
-            })
-            self.drawing_state["last_command"] = f"텍스트 '{text}' 추가, 위치{position}, 높이{height}, 회전{rotation}"
-            self.drawing_state["last_result"] = "성공"
-        else:
-            self.drawing_state["last_result"] = "실패"
-
-        return result
-
-    def draw_hatch(self, points, pattern_name="SOLID", scale=1.0, layer=None, color=None):
-        """해치(채우기) 그리기"""
-        if not self.controller.is_running():
-            self.start_cad()
-        
-        # 현재 레이어 또는 지정된 레이어 사용
-        current_layer = layer or self.drawing_state["current_layer"]
-        
-        result = self.controller.draw_hatch(points, pattern_name, scale, current_layer, color)
-        if result:
-            self.drawing_state["entities"].append({
-                "type": "hatch",
-                "points": points,
-                "pattern_name": pattern_name,
-                "scale": scale,
-                "layer": current_layer,
-                "color": color
-            })
-            self.drawing_state["last_command"] = f"해치 그리기, 점집합{points}, 패턴{pattern_name}, 비율{scale}, 레이어{current_layer}"
-            self.drawing_state["last_result"] = "성공"
-        else:
-            self.drawing_state["last_result"] = "실패"
-
-        return result
-
-    def add_dimension(self, start_point, end_point, text_position=None,textheight=5, layer=None, color=None):
-        """선형 치수 추가"""
-        if not self.controller.is_running():
-            self.start_cad()
-        
-        # 현재 레이어 또는 지정된 레이어 사용
-        current_layer = layer or self.drawing_state["current_layer"]
-        
-        result = self.controller.add_dimension(start_point, end_point, text_position, textheight,current_layer, color)
-        if result:
-            self.drawing_state["entities"].append({
-                "type": "dimension",
-                "start": start_point,
-                "end": end_point,
-                "text_position": text_position,
-                "textheight": textheight,
-                "layer": current_layer,
-                "color": color
-            })
-            self.drawing_state["last_command"] = f"{start_point}에서 {end_point}까지 치수 추가"
-            self.drawing_state["last_result"] = "성공"
-        else:
-            self.drawing_state["last_result"] = "실패"
-
-        return result
+            logger.warning(f"재연결 실패: {describe_error(e)}")
+        return self.worker.status()
 
 
-    def save_drawing(self, file_path):
-        """도면 저장"""
-        if not self.controller.is_running():
-            return False
+# ======================================================================
+# 도구 정의
+# ======================================================================
 
-        result = self.controller.save_drawing(file_path)
-        if result:
-            self.drawing_state["last_command"] = f"{file_path}에 도면 저장"
-            self.drawing_state["last_result"] = "성공"
-        else:
-            self.drawing_state["last_result"] = "실패"
-        
-        return result
-    
-    # ------------------------------------------------------------------
-    # 도면 읽기 (읽기 전용)
-    #
-    # 캐디안은 Export와 화면 캡처가 모두 막혀 있으므로, COM으로 엔티티를
-    # 읽어 파이썬이 직접 이미지를 그린다. cad_reader 모듈이 그 역할을 한다.
-    # ------------------------------------------------------------------
+PT = {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 3}
+PTS = {"type": "array", "items": PT}
+LAYER = {"type": "string", "description": "레이어 (생략 시 '0'). 없으면 만든다. 현재 레이어는 바꾸지 않는다"}
+COLOR = {"type": ["string", "integer"],
+         "description": "색: ACI 번호(1~255), BYLAYER, BYBLOCK, red/빨강 등. 생략 시 BYLAYER"}
+LINEWEIGHT = {"type": "number", "description": "선두께(1/100mm: 13, 25, 50...). -1=BYLAYER"}
+HANDLE = {"type": "string", "description": "엔티티 핸들"}
+JUSTIFY = {"type": "string",
+           "enum": ["left", "center", "right", "middle", "top_left", "top_center", "top_right",
+                    "middle_left", "middle_center", "middle_right",
+                    "bottom_left", "bottom_center", "bottom_right"],
+           "description": "정렬. 지정하면 position이 그 정렬점이 된다 (방 이름은 middle_center)"}
+ATTACH = {"type": "string",
+          "enum": ["top_left", "top_center", "top_right", "middle_left", "middle_center",
+                   "middle_right", "bottom_left", "bottom_center", "bottom_right"],
+          "description": "MText 부착점 (position이 이 점이 된다). 기본 top_left"}
+SELECTOR = {
+    "type": "object",
+    "description": ("대상 조건(모두 AND): window [x1,y1,x2,y2] + mode crossing(걸치면, 기본)|"
+                    "inside(완전 포함), layers [..], types [line, polyline, text, mtext, "
+                    "dimension, hatch, circle, arc, block], handles [..]. window 판정은 텍스트 "
+                    "포함 실제 외곽(GetBoundingBox) 기준"),
+    "properties": {
+        "window": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4},
+        "mode": {"type": "string", "enum": ["crossing", "inside"]},
+        "layers": {"type": "array", "items": {"type": "string"}},
+        "types": {"type": "array", "items": {"type": "string"}},
+        "handles": {"type": "array", "items": {"type": "string"}},
+    },
+}
+EDIT_PARAMS = {
+    "offset": {"type": "array", "items": {"type": "number"},
+               "description": "move/copy 변위 [dx, dy]"},
+    "base_point": {"type": "array", "items": {"type": "number"},
+                   "description": "rotate/scale 기준점 [x, y]"},
+    "angle": {"type": "number", "description": "rotate 각도(도, 반시계)"},
+    "factor": {"type": "number", "description": "scale 배율(>0)"},
+    "point1": {"type": "array", "items": {"type": "number"}, "description": "mirror 축 첫 점"},
+    "point2": {"type": "array", "items": {"type": "number"}, "description": "mirror 축 둘째 점"},
+    "make_copy": {"type": "boolean", "description": "mirror 시 원본 유지 (기본 true)"},
+    "distance": {"type": "number", "description": "offset 거리. 부호가 방향"},
+    "layer": {"type": "string", "description": "set_properties: 옮길 레이어"},
+    "color": COLOR,
+    "lineweight": LINEWEIGHT,
+    "linetype": {"type": "string", "description": "set_properties: 선종류 (BYLAYER, CONTINUOUS 등)"},
+}
+EDIT_OPS = ["move", "rotate", "scale", "copy", "mirror", "offset", "delete", "set_properties"]
 
-    def _doc_and_lib(self):
-        """작업 스레드 안에서만 호출할 것. COM 객체는 스레드를 넘길 수 없다."""
-        raise RuntimeError("_doc_and_lib는 작업 스레드 내부에서만 사용합니다")
+SPEC_HELP = (
+    "entities 항목 형식 (모두 layer/color/lineweight/linetype 지정 가능):\n"
+    "line{start,end} circle{center,radius} arc{center,radius,start_angle,end_angle} "
+    "ellipse{center,major_axis,minor_axis,rotation} rectangle{corner1,corner2} "
+    "polyline{points,closed} text{position,text,height,rotation,justify} "
+    "mtext{position,text,height,width,attachment} "
+    "dimension{start,end,offset|text_position,orientation:aligned|horizontal|vertical,textheight} "
+    "hatch{points,pattern_name,scale} "
+    "wall{start,end,thickness,justify:center|left|right} — 벽 중심선(또는 한쪽 면)으로 닫힌 사각형 "
+    "door{hinge,width,angle,swing:left|right} — angle은 경첩에서 닫힌 문짝이 향하는 방향(도), "
+    "swing은 그 방향 기준 열리는 쪽. 문짝 선+1/4호 "
+    "window{start,end,thickness,lines} — 벽 중심선 위 창 구간에 평행선 lines개(기본 3)")
 
-    @staticmethod
-    def _lib_of(controller):
+
+class Tool:
+    def __init__(self, name: str, description: str, properties: Dict[str, Any],
+                 required: List[str], handler: Callable[[CADService, Dict[str, Any]], Any]):
+        self.name = name
+        self.description = description
+        self.schema = {"type": "object", "properties": properties, "required": required}
+        self.handler = handler
+
+
+TOOLS: Dict[str, Tool] = {}
+
+
+def tool(name: str, description: str, properties: Dict[str, Any] = None,
+         required: List[str] = ()):
+    def deco(fn):
+        TOOLS[name] = Tool(name, description, properties or {}, list(required), fn)
+        return fn
+    return deco
+
+
+def _opt(args: Dict[str, Any], *keys) -> Dict[str, Any]:
+    return {k: args[k] for k in keys if args.get(k) is not None}
+
+
+# ---------------- 작도 ----------------
+
+@tool("draw_line", "직선을 그린다. 반환: 핸들",
+      {"start_point": PT, "end_point": PT, "layer": LAYER, "color": COLOR, "lineweight": LINEWEIGHT},
+      ["start_point", "end_point"])
+def t_draw_line(svc, a):
+    h = svc.run(lambda c: c.draw_line(a["start_point"], a["end_point"], a.get("layer"),
+                                      a.get("color"), a.get("lineweight")), "draw_line", mutating=True)
+    return f"직선 생성: {h}"
+
+
+@tool("draw_circle", "원을 그린다. 반환: 핸들",
+      {"center": PT, "radius": {"type": "number"}, "layer": LAYER, "color": COLOR,
+       "lineweight": LINEWEIGHT}, ["center", "radius"])
+def t_draw_circle(svc, a):
+    h = svc.run(lambda c: c.draw_circle(a["center"], a["radius"], a.get("layer"),
+                                        a.get("color"), a.get("lineweight")), "draw_circle", mutating=True)
+    return f"원 생성: {h}"
+
+
+@tool("draw_arc",
+      "호를 그린다. 각도는 도 단위, 반시계 방향으로 start_angle에서 end_angle까지 "
+      "(예: 270→0도 90° 호, 0→270은 270° 호). 반환: 핸들",
+      {"center": PT, "radius": {"type": "number"}, "start_angle": {"type": "number"},
+       "end_angle": {"type": "number"}, "layer": LAYER, "color": COLOR, "lineweight": LINEWEIGHT},
+      ["center", "radius", "start_angle", "end_angle"])
+def t_draw_arc(svc, a):
+    h = svc.run(lambda c: c.draw_arc(a["center"], a["radius"], a["start_angle"], a["end_angle"],
+                                     a.get("layer"), a.get("color"), a.get("lineweight")),
+                "draw_arc", mutating=True)
+    return f"호 생성: {h}"
+
+
+@tool("draw_ellipse", "타원을 그린다. rotation은 장축 각도(도). 반환: 핸들",
+      {"center": PT, "major_axis": {"type": "number"}, "minor_axis": {"type": "number"},
+       "rotation": {"type": "number"}, "layer": LAYER, "color": COLOR, "lineweight": LINEWEIGHT},
+      ["center", "major_axis", "minor_axis"])
+def t_draw_ellipse(svc, a):
+    h = svc.run(lambda c: c.draw_ellipse(a["center"], a["major_axis"], a["minor_axis"],
+                                         a.get("rotation") or 0, a.get("layer"), a.get("color"),
+                                         a.get("lineweight")), "draw_ellipse", mutating=True)
+    return f"타원 생성: {h}"
+
+
+@tool("draw_polyline", "폴리라인을 그린다. 반환: 핸들",
+      {"points": PTS, "closed": {"type": "boolean"}, "layer": LAYER, "color": COLOR,
+       "lineweight": LINEWEIGHT}, ["points"])
+def t_draw_polyline(svc, a):
+    h = svc.run(lambda c: c.draw_polyline(a["points"], bool(a.get("closed")), a.get("layer"),
+                                          a.get("color"), a.get("lineweight")),
+                "draw_polyline", mutating=True)
+    return f"폴리라인 생성: {h}"
+
+
+@tool("draw_rectangle", "사각형(닫힌 폴리라인)을 그린다. 반환: 핸들",
+      {"corner1": PT, "corner2": PT, "layer": LAYER, "color": COLOR, "lineweight": LINEWEIGHT},
+      ["corner1", "corner2"])
+def t_draw_rectangle(svc, a):
+    h = svc.run(lambda c: c.draw_rectangle(a["corner1"], a["corner2"], a.get("layer"),
+                                           a.get("color"), a.get("lineweight")),
+                "draw_rectangle", mutating=True)
+    return f"사각형 생성: {h}"
+
+
+@tool("draw_text", "한 줄 텍스트. justify로 정렬 (방 이름 가운데는 middle_center). 반환: 핸들",
+      {"position": PT, "text": {"type": "string"}, "height": {"type": "number"},
+       "rotation": {"type": "number", "description": "회전(도)"}, "justify": JUSTIFY,
+       "layer": LAYER, "color": COLOR}, ["position", "text"])
+def t_draw_text(svc, a):
+    h = svc.run(lambda c: c.draw_text(a["position"], a["text"], a.get("height", 2.5),
+                                      a.get("rotation") or 0, a.get("layer"), a.get("color"),
+                                      a.get("justify")), "draw_text", mutating=True)
+    return f"텍스트 생성: {h}"
+
+
+@tool("draw_mtext",
+      "여러 줄 텍스트(MText). width=0이면 자동 폭. 줄바꿈은 \\P. 반환: 핸들",
+      {"position": PT, "text": {"type": "string"}, "height": {"type": "number"},
+       "width": {"type": "number"}, "attachment": ATTACH,
+       "rotation": {"type": "number", "description": "회전(도)"}, "layer": LAYER, "color": COLOR},
+      ["position", "text"])
+def t_draw_mtext(svc, a):
+    h = svc.run(lambda c: c.draw_mtext(a["position"], a["text"], a.get("height", 2.5),
+                                       a.get("width", 0), a.get("attachment"),
+                                       a.get("rotation") or 0, a.get("layer"), a.get("color")),
+                "draw_mtext", mutating=True)
+    return f"MText 생성: {h}"
+
+
+@tool("draw_hatch", "해치(채우기). 경계 폴리라인도 함께 만든다. 반환: 경계/해치 핸들",
+      {"points": PTS, "pattern_name": {"type": "string", "description": "기본 SOLID"},
+       "scale": {"type": "number"}, "layer": LAYER, "color": COLOR}, ["points"])
+def t_draw_hatch(svc, a):
+    r = svc.run(lambda c: c.draw_hatch(a["points"], a.get("pattern_name", "SOLID"),
+                                       a.get("scale", 1.0), a.get("layer"), a.get("color")),
+                "draw_hatch", mutating=True)
+    return f"해치 생성: 경계 {r['boundary']}, 해치 {r['hatch']}"
+
+
+@tool("add_dimension",
+      "치수 하나. text_position(치수선 위치)을 주거나, offset(측정선에서 치수선까지 거리, 부호=방향)"
+      "과 orientation(aligned|horizontal|vertical)을 준다. 여러 개면 add_dimension_chain이나 "
+      "draw_entities의 dimension 타입을 쓴다. 반환: 핸들",
+      {"start_point": PT, "end_point": PT, "text_position": PT, "offset": {"type": "number"},
+       "orientation": {"type": "string", "enum": ["aligned", "horizontal", "vertical"]},
+       "textheight": {"type": "number"}, "layer": LAYER, "color": COLOR},
+      ["start_point", "end_point"])
+def t_add_dimension(svc, a):
+    h = svc.run(lambda c: c.add_dimension(a["start_point"], a["end_point"], a.get("text_position"),
+                                          a.get("textheight"), a.get("layer"), a.get("color"),
+                                          a.get("orientation", "aligned"), a.get("offset")),
+                "add_dimension", mutating=True)
+    return f"치수 생성: {h}"
+
+
+@tool("add_dimension_chain",
+      "연속 치수 + 전체 치수를 한 번에 (도면 한 면의 그리드 치수). points는 잴 점들(정렬은 자동). "
+      "offset: 가장 바깥 점에서 치수선까지 거리(+면 위/오른쪽, -면 아래/왼쪽). overall_offset 생략 시 "
+      "한 단 더 바깥에 전체 치수. 반환: 핸들",
+      {"points": PTS, "orientation": {"type": "string", "enum": ["horizontal", "vertical"]},
+       "offset": {"type": "number"}, "overall": {"type": "boolean", "description": "전체 치수 (기본 true)"},
+       "overall_offset": {"type": "number"}, "textheight": {"type": "number"},
+       "layer": LAYER, "color": COLOR}, ["points", "orientation"])
+def t_add_dimension_chain(svc, a):
+    r = svc.run(lambda c: c.add_dimension_chain(
+        a["points"], a["orientation"], a.get("offset"), a.get("overall", True),
+        a.get("overall_offset"), a.get("textheight"), a.get("layer"), a.get("color")),
+        "add_dimension_chain", timeout=LONG_TIMEOUT, mutating=True)
+    return f"연속 치수 {len(r['chain'])}개: {', '.join(r['chain'])}" + \
+        (f" / 전체 치수: {r['overall']}" if r.get("overall") else "")
+
+
+@tool("draw_entities",
+      "여러 도형을 한 번의 호출로 그린다. 기본 응답은 항목 순서대로의 핸들 목록(실패 항목은 ✗)과 "
+      "실패 사유. atomic=true면 하나라도 실패 시 이번 호출에서 만든 것을 모두 지운다. "
+      "default_layer/default_color는 layer/color를 안 준 항목에 적용.\n" + SPEC_HELP,
+      {"entities": {"type": "array", "items": {"type": "object"}},
+       "atomic": {"type": "boolean"}, "default_layer": {"type": "string"},
+       "default_color": COLOR,
+       "verbose": {"type": "boolean", "description": "항목마다 한 줄로 자세히"}},
+      ["entities"])
+def t_draw_entities(svc, a):
+    entities = a["entities"]
+    # 캐디안은 도형 하나에 100~160ms가 든다 (AddLine만 ~64ms, 2026-10-12 실측).
+    # 개수에 비례해 넉넉히 잡되 서버 전체 상한보다는 짧게.
+    timeout = min(HARD_TIMEOUT - 30, DEFAULT_TIMEOUT + 0.5 * len(entities))
+    r = svc.run(lambda c: c.draw_entities(entities, bool(a.get("atomic")), a.get("default_layer"),
+                                          a.get("default_color")),
+                f"draw_entities({len(entities)})", timeout=timeout, mutating=True)
+    results = r["results"]
+    ok = [x for x in results if "handles" in x]
+    lines = [f"배치 작도: {len(entities)}개 중 {len(ok)}개 성공"]
+    if r.get("rolled_back") is not None:
+        lines[0] += (f" — atomic: {r['atomic_failed_at']}번에서 실패해 이미 만든 "
+                     f"{r['rolled_back']}개를 지웠습니다")
+    if a.get("verbose"):
+        for x in results:
+            lines.append(f"[{x['index']}] " + (",".join(x["handles"]) if "handles" in x
+                                              else "✗ " + x["error"]))
+    else:
+        if r.get("rolled_back") is None:
+            lines.append("handles: " + " | ".join(",".join(x["handles"]) if "handles" in x else "✗"
+                                                  for x in results))
+        for x in results:
+            if "error" in x:
+                lines.append(f"실패 [{x['index']}]: {x['error']}")
+    return "\n".join(lines)
+
+
+# ---------------- 편집 ----------------
+
+def _edit_params(a: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in a.items() if k in EDIT_PARAMS and v is not None}
+
+
+def _summarize_edit(op: str, r: Dict[str, Any]) -> str:
+    results = r["results"]
+    errs = [x for x in results if "error" in x]
+    new = [h for x in results for h in ([x["new"]] if isinstance(x.get("new"), str)
+                                        else (x.get("new") or []))]
+    lines = [f"{op}: 대상 {r['matched']}개, 성공 {len(results) - len(errs)}개"]
+    if new:
+        lines.append("새 핸들: " + ", ".join(new))
+    for x in errs[:20]:
+        lines.append(f"실패 {x['handle']}: {x['error']}")
+    if len(errs) > 20:
+        lines.append(f"... 실패 {len(errs) - 20}개 더")
+    return "\n".join(lines)
+
+
+@tool("edit_entity",
+      "핸들 하나를 편집. operation별 인자: move{offset} rotate{base_point,angle} "
+      "scale{base_point,factor} copy{offset?} mirror{point1,point2,make_copy} offset{distance} "
+      "delete{} set_properties{layer?,color?,lineweight?,linetype?}. 여러 개는 edit_entities",
+      {"handle": HANDLE, "operation": {"type": "string", "enum": EDIT_OPS}, **EDIT_PARAMS},
+      ["handle", "operation"])
+def t_edit_entity(svc, a):
+    op = a["operation"]
+    r = svc.run(lambda c: c.edit_entity(a["handle"], op, **_edit_params(a)),
+                f"edit_entity({op})", mutating=True)
+    text = f"편집 완료: {op} (핸들 {a['handle']})"
+    if r.get("new"):
+        new = r["new"] if isinstance(r["new"], str) else ", ".join(r["new"])
+        text += f" → 새 핸들 {new}"
+    return text
+
+
+@tool("edit_entities",
+      "여러 엔티티에 같은 편집을 한 번에. 대상은 handles(목록) 또는 selector(영역/레이어/종류) 중 하나. "
+      "예: 영역 전체를 x=32700 축으로 반전 → selector{window:[...],mode:inside}, operation mirror, "
+      "point1 [32700,0], point2 [32700,1], make_copy false. 레이어 옮기기 → set_properties{layer}. "
+      "인자는 edit_entity와 같다. 결과는 핸들별 성공/실패",
+      {"operation": {"type": "string", "enum": EDIT_OPS},
+       "handles": {"type": "array", "items": {"type": "string"}},
+       "selector": SELECTOR, **EDIT_PARAMS}, ["operation"])
+def t_edit_entities(svc, a):
+    op = a["operation"]
+    r = svc.run(lambda c: c.edit_entities(op, a.get("handles"), a.get("selector"), **_edit_params(a)),
+                f"edit_entities({op})", timeout=LONG_TIMEOUT, mutating=True)
+    return _summarize_edit(op, r)
+
+
+@tool("edit_text",
+      "Text/MText의 내용·높이·위치·정렬(Text는 justify, MText는 attachment)·폭을 바꾼다. "
+      "위치 없이 justify만 바꾸면 지금 보이는 자리를 기준으로 정렬점을 잡는다",
+      {"handle": HANDLE, "text": {"type": "string"}, "height": {"type": "number"},
+       "position": PT, "justify": JUSTIFY, "attachment": ATTACH, "width": {"type": "number"},
+       "rotation": {"type": "number"}}, ["handle"])
+def t_edit_text(svc, a):
+    r = svc.run(lambda c: c.edit_text(a["handle"], a.get("text"), a.get("height"),
+                                      a.get("position"), a.get("justify"), a.get("attachment"),
+                                      a.get("width"), a.get("rotation")),
+                "edit_text", mutating=True)
+    return "텍스트 수정: " + _dumps(cad_reader.round_floats(r, 1))
+
+
+@tool("array_entity",
+      "배열 복제. polar{count(원본 포함),center,included_angle,rotate_objects} 또는 "
+      "rectangular{rows,columns,row_spacing,column_spacing}",
+      {"handle": HANDLE, "mode": {"type": "string", "enum": ["polar", "rectangular"]},
+       "count": {"type": "integer"}, "center": {"type": "array", "items": {"type": "number"}},
+       "included_angle": {"type": "number"}, "rotate_objects": {"type": "boolean"},
+       "rows": {"type": "integer"}, "columns": {"type": "integer"},
+       "row_spacing": {"type": "number"}, "column_spacing": {"type": "number"}},
+      ["handle", "mode"])
+def t_array_entity(svc, a):
+    if a["mode"] == "polar":
+        svc.run(lambda c: c.array_polar(a["handle"], a["count"], a.get("center", (0, 0)),
+                                        a.get("included_angle", 360.0), a.get("rotate_objects", True)),
+                "array_polar", mutating=True)
+    else:
+        svc.run(lambda c: c.array_rectangular(a["handle"], a.get("rows", 1), a.get("columns", 1),
+                                              a.get("row_spacing", 0.0), a.get("column_spacing", 0.0)),
+                "array_rectangular", mutating=True)
+    return f"배열 복제 완료 ({a['mode']}, 핸들 {a['handle']})"
+
+
+@tool("insert_opening",
+      "사각형 벽(꼭짓점 4개 닫힌 폴리라인)에 개구부를 낸다. 벽을 개구부 양옆 두 조각으로 다시 그리고 "
+      "원래 벽은 지운다. kind=door면 문 기호(문짝+1/4호, swing_toward 쪽으로 열림, hinge_at에 가까운 "
+      "문설주가 경첩), window면 창 평행선. center는 개구부 중심(벽 축 위의 점)",
+      {"handle": HANDLE, "center": PT, "width": {"type": "number"},
+       "kind": {"type": "string", "enum": ["none", "door", "window"]},
+       "swing_toward": PT, "hinge_at": PT,
+       "door_layer": {"type": "string"}, "window_layer": {"type": "string"},
+       "window_lines": {"type": "integer"}}, ["handle", "center", "width"])
+def t_insert_opening(svc, a):
+    r = svc.run(lambda c: c.insert_opening(a["handle"], a["center"], a["width"], a.get("kind", "none"),
+                                           a.get("swing_toward"), a.get("hinge_at"),
+                                           a.get("door_layer"), a.get("window_layer"),
+                                           a.get("window_lines", 3)),
+                "insert_opening", mutating=True)
+    return (f"개구부 완료: 벽 {r['removed']} → 조각 {', '.join(r['pieces']) or '없음'}"
+            + (f" / 문 {', '.join(r['door'])}" if r["door"] else "")
+            + (f" / 창 {', '.join(r['window'])}" if r["window"] else ""))
+
+
+@tool("break_entity",
+      "선/폴리라인을 두 점 사이에서 끊어 낸다(BREAK). 닫힌 폴리라인은 두 점 사이 두 경로 중 "
+      "remove=short(기본)면 짧은 쪽을 지우고 나머지를 열린 폴리라인으로 남긴다. 외벽에 현관문 낼 때 등",
+      {"handle": HANDLE, "point1": PT, "point2": PT,
+       "remove": {"type": "string", "enum": ["short", "long"]}},
+      ["handle", "point1", "point2"])
+def t_break_entity(svc, a):
+    r = svc.run(lambda c: c.break_entity(a["handle"], a["point1"], a["point2"],
+                                         a.get("remove", "short")), "break_entity", mutating=True)
+    return f"끊기 완료: {r['removed']} → {', '.join(r['pieces']) or '남은 조각 없음'}"
+
+
+# ---------------- 삭제 ----------------
+
+@tool("delete_by_layer", "레이어의 모든 엔티티를 삭제. 반환: 삭제 개수",
+      {"layer": {"type": "string"}}, ["layer"])
+def t_delete_by_layer(svc, a):
+    n = svc.run(lambda c: c.delete_by_layer(a["layer"]), "delete_by_layer",
+                timeout=LONG_TIMEOUT, mutating=True)
+    return f"레이어 '{a['layer']}' 엔티티 {n}개 삭제"
+
+
+@tool("delete_by_window",
+      "사각형 범위에 걸리는(crossing, 기본) 또는 완전히 들어온(inside) 엔티티 삭제. 판정은 텍스트 포함 "
+      "실제 외곽 기준. layers/types로 더 좁힐 수 있다. 반환: 삭제 개수",
+      {"x1": {"type": "number"}, "y1": {"type": "number"}, "x2": {"type": "number"},
+       "y2": {"type": "number"}, "mode": {"type": "string", "enum": ["crossing", "inside"]},
+       "layers": {"type": "array", "items": {"type": "string"}},
+       "types": {"type": "array", "items": {"type": "string"}}},
+      ["x1", "y1", "x2", "y2"])
+def t_delete_by_window(svc, a):
+    n = svc.run(lambda c: c.delete_by_window(a["x1"], a["y1"], a["x2"], a["y2"],
+                                             a.get("mode", "crossing"), a.get("layers"), a.get("types")),
+                "delete_by_window", timeout=LONG_TIMEOUT, mutating=True)
+    return f"윈도우 ({a['x1']},{a['y1']})-({a['x2']},{a['y2']}) {a.get('mode', 'crossing')}: {n}개 삭제"
+
+
+# ---------------- 읽기 ----------------
+
+@tool("cad_status",
+      "연결 상태를 즉시 보고(막혀 있어도 바로 답한다). state: ready|busy(작업 중, 어떤 작업이 몇 초째)|"
+      "stuck(막힘)|idle_not_connected(첫 작업 때 자동 연결)|not_started. 장애가 나면 재시작 전에 "
+      "먼저 이걸 호출해 결과를 남긴다")
+def t_cad_status(svc, a):
+    return _dumps(svc.status())
+
+
+@tool("cad_reconnect",
+      "작업 스레드를 새로 만들고 캐디안에 다시 연결한다. stuck이 오래 안 풀릴 때, 캐디안에서 ESC를 "
+      "누른 뒤 호출. 대기 중이던 요청은 취소된다")
+def t_cad_reconnect(svc, a):
+    return "재연결 결과: " + _dumps(svc.reconnect())
+
+
+@tool("get_drawing_info",
+      "도면 전역 정보: 문서명, 엔티티 수, 범위(EXTMIN/EXTMAX, 읽기 전에 전체 보기로 갱신), "
+      "레이어 목록, 현재 레이어/색, 단위")
+def t_get_drawing_info(svc, a):
+    def job(c):
+        c.zoom_extents()
+        return cad_reader.drawing_info(c.doc, c.lib)
+    info = svc.run(job, "get_drawing_info", timeout=LONG_TIMEOUT)
+    return _dumps(cad_reader.round_floats(info, 1))
+
+
+@tool("list_entities",
+      "엔티티 목록. 기본은 좌표 배열(points/loops)을 뺀 요약, 숫자는 소수 1자리. 전체 모양 확인은 "
+      "preview_drawing이 훨씬 싸다. window/layer/entity_type으로 좁히고, 정확한 좌표가 필요할 때만 "
+      "include_geometry. fields로 필요한 키만 받을 수 있다(예: [\"Handle\",\"Layer\"]). "
+      "텍스트에는 justify/attachment와 실제 외곽 bbox가 들어 있다",
+      {"layer": {"type": "string"}, "entity_type": {"type": "string",
+                                                    "description": "line, polyline, text, mtext, dimension, hatch, circle, arc, block"},
+       "window": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4},
+       "mode": {"type": "string", "enum": ["crossing", "inside"]},
+       "limit": {"type": "integer", "description": "최대 개수 (기본 100)"},
+       "include_geometry": {"type": "boolean"},
+       "precision": {"type": "integer", "description": "소수 자릿수 (기본 1)"},
+       "fields": {"type": "array", "items": {"type": "string"}}})
+def t_list_entities(svc, a):
+    selector = {}
+    if a.get("layer"):
+        selector["layers"] = [a["layer"]]
+    if a.get("entity_type"):
+        selector["types"] = [a["entity_type"]]
+    if a.get("window"):
+        selector["window"] = a["window"]
+        selector["mode"] = a.get("mode", "crossing")
+
+    def job(c):
+        if selector:
+            return [cad_reader.read_entity(e, c.lib) for _, e in c.select(selector)]
+        return cad_reader.read_entities(c.doc, c.lib)
+
+    entities = svc.run(job, "list_entities", timeout=LONG_TIMEOUT)
+    total = len(entities)
+    limit = max(1, int(a.get("limit", 100)))
+    page = entities[:limit]
+    if not a.get("include_geometry"):
+        page = [cad_reader.compact_entity(e) for e in page]
+    fields = a.get("fields")
+    if fields:
+        page = [{k: e[k] for k in fields if k in e} for e in page]
+    precision = int(a.get("precision", 1))
+    lines = [f"조건에 맞는 엔티티 {total}개" + (f" (앞 {len(page)}개만 표시)" if len(page) < total else "")]
+    lines += [_dumps(cad_reader.round_floats(e, precision)) for e in page]
+    return "\n".join(lines)
+
+
+@tool("get_bbox", "엔티티 실제 외곽 [minx,miny,maxx,maxy] (텍스트 폭 확인용)",
+      {"handles": {"type": "array", "items": {"type": "string"}}}, ["handles"])
+def t_get_bbox(svc, a):
+    r = svc.run(lambda c: c.get_bbox(a["handles"]), "get_bbox", timeout=LONG_TIMEOUT)
+    return "\n".join(_dumps(x) for x in r)
+
+
+@tool("preview_drawing",
+      "도면을 PNG로 렌더링. 비용이 엔티티 수와 거의 무관해서 전체 확인은 list_entities 대신 이것을 "
+      "쓴다. zoom_to로 영역 확대, show_labels로 핸들 표시",
+      {"width": {"type": "integer", "description": "기본 800, 최대 2000"},
+       "height": {"type": "integer", "description": "기본 600, 최대 2000"},
+       "show_labels": {"type": "boolean"},
+       "zoom_to": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}})
+def t_preview_drawing(svc, a):
+    def job(c):
+        entities = cad_reader.read_entities(c.doc, c.lib)
         try:
-            return controller.app.Library
-        except Exception:
-            return None
-
-    @staticmethod
-    def _ensure(controller):
-        if not controller.is_running():
-            controller.start_cad()
-        if not controller.is_running():
-            raise RuntimeError("CAD에 연결할 수 없습니다")
-        return controller.doc, CADService._lib_of(controller)
-
-    def get_drawing_info(self) -> Dict[str, Any]:
-        """도면 범위, 레이어, 엔티티 수 등 전역 정보"""
-        def job(controller):
-            doc, lib = CADService._ensure(controller)
-            # Regen만으로는 EXTMIN/EXTMAX가 갱신되지 않는다. 읽기 직전에
-            # zoom_extents로 범위를 재계산해야 정확한 값이 나온다.
-            controller.zoom_extents()
-            return cad_reader.drawing_info(doc, lib)
-        return self.worker.run(job)
-
-    def list_entities(self, layer=None, entity_type=None, limit=100,
-                      include_geometry=False):
-        """엔티티 목록. (표시할 목록, 전체 개수) 반환
-
-        include_geometry=False(기본)면 points/loops 좌표 배열을 빼고 요약만
-        반환한다(cad_reader.compact_entity). 큰 도면에서 좌표까지 다
-        붙이면 응답이 토큰 한도를 넘길 수 있다 — 실제로 217개 엔티티에서
-        56,570자로 초과된 적이 있다(history.md 2026-09-04 참고).
-        """
-        def job(controller):
-            doc, lib = CADService._ensure(controller)
-            return cad_reader.read_entities(doc, lib)
-
-        entities = self.worker.run(job)
-
-        if layer:
-            entities = [e for e in entities if e.get('Layer') == layer]
-        if entity_type:
-            key = str(entity_type).lower()
-            entities = [e for e in entities
-                        if key in str(e.get('ObjectName', '')).lower()
-                        or key in str(e.get('EntityName', '')).lower()]
-
-        total = len(entities)
-        try:
-            limit = max(1, int(limit))
-        except (TypeError, ValueError):
-            limit = 100
-        page = entities[:limit]
-        if not include_geometry:
-            page = [cad_reader.compact_entity(e) for e in page]
-        return page, total
-
-    def preview_drawing(self, width=800, height=600, show_labels=False,
-                        zoom_to=None):
-        """미리보기 PNG 바이트와 요약 텍스트 반환
-
-        COM 읽기는 작업 스레드에서, 이미지 렌더링은 여기서 한다.
-        렌더링은 순수 파이썬이라 CAD 상태와 무관하다. 기본 해상도를
-        800x600으로 낮춰뒀다 — 일상적인 확인에는 충분하고, 세밀하게 봐야
-        하면 호출 시 width/height를 키우면 된다(최대 2000).
-        """
-        def job(controller):
-            doc, lib = CADService._ensure(controller)
-            entities = cad_reader.read_entities(doc, lib)
-            try:
-                expanded = cad_reader.expand_blocks(entities, doc, lib)
-            except Exception as e:
-                logger.warning(f"블록 펼치기 실패, 원본 사용: {e}")
-                expanded = entities
-            return entities, expanded
-
-        entities, expanded = self.worker.run(job)
-        summary = cad_reader.summarize(entities)
-
-        bounds = None
-        if zoom_to and len(zoom_to) == 4:
-            bounds = tuple(float(v) for v in zoom_to)
-
-        png = cad_reader.render_png(
-            expanded,
-            width=max(200, min(int(width), 2000)),
-            height=max(200, min(int(height), 2000)),
-            show_labels=bool(show_labels),
-            bounds=bounds)
-        return png, summary
-
-    # ------------------------------------------------------------------
-    # 편집 / 블록
-    # ------------------------------------------------------------------
-
-    def edit_entity(self, handle, operation, **kwargs) -> bool:
-        """핸들로 지목한 엔티티를 편집"""
-        if not self.controller.is_running():
-            self.start_cad()
-
-        op = str(operation).lower()
-        c = self.controller
-
-        if op == "move":
-            return c.move_entity(handle, kwargs["offset"])
-        if op == "rotate":
-            return c.rotate_entity(handle, kwargs.get("base_point", (0, 0)),
-                                   kwargs["angle"])
-        if op == "scale":
-            return c.scale_entity(handle, kwargs.get("base_point", (0, 0)),
-                                  kwargs["factor"])
-        if op == "copy":
-            new_handle = c.copy_entity(handle, kwargs.get("offset"))
-            return new_handle if new_handle else False
-        if op == "mirror":
-            return c.mirror_entity(handle, kwargs["point1"], kwargs["point2"],
-                                   kwargs.get("make_copy", True))
-        if op == "offset":
-            return c.offset_entity(handle, kwargs["distance"])
-        if op == "delete":
-            return c.delete_entity(handle)
-
-        raise ValueError(f"지원하지 않는 편집 작업: {operation}")
-
-    def array_entity(self, handle, mode, **kwargs) -> bool:
-        """엔티티 배열 복제"""
-        if not self.controller.is_running():
-            self.start_cad()
-
-        if str(mode).lower() in ("polar", "원형"):
-            return self.controller.array_polar(
-                handle,
-                kwargs["count"],
-                kwargs.get("center", (0, 0)),
-                kwargs.get("included_angle", 360.0),
-                kwargs.get("rotate_objects", True))
-
-        return self.controller.array_rectangular(
-            handle,
-            kwargs.get("rows", 1),
-            kwargs.get("columns", 1),
-            kwargs.get("row_spacing", 0.0),
-            kwargs.get("column_spacing", 0.0))
-
-    def list_blocks(self):
-        if not self.controller.is_running():
-            self.start_cad()
-        return self.controller.list_blocks()
-
-    def create_block(self, name, entities, attributes=None, base_point=(0, 0)):
-        if not self.controller.is_running():
-            self.start_cad()
-        return self.controller.create_block(name, entities, attributes,
-                                            base_point)
-
-    def insert_block(self, name, position, scale=1.0, rotation=0.0,
-                     attributes=None, layer=None):
-        if not self.controller.is_running():
-            self.start_cad()
-        return self.controller.insert_block(name, position, scale, rotation,
-                                            attributes, layer)
-
-    def set_block_attributes(self, handle, attributes):
-        if not self.controller.is_running():
-            self.start_cad()
-        return self.controller.set_block_attributes(handle, attributes)
-
-    # ------------------------------------------------------------------
-    # 배치 작도 / 삭제
-    # ------------------------------------------------------------------
-
-    def draw_entities(self, entities):
-        """여러 도형을 한 번의 호출로 그린다. 각 항목은 create_block의
-        entities와 같은 형식 (type + 좌표 키 + layer/color 등)."""
-        if not self.controller.is_running():
-            self.start_cad()
-        handles = self.controller.draw_entities(entities)
-        ok = sum(1 for h in handles if h)
-        self.drawing_state["last_command"] = f"배치 작도 {len(entities)}개 요청"
-        self.drawing_state["last_result"] = f"{ok}/{len(entities)}개 성공"
-        return handles
-
-    def delete_by_layer(self, layer):
-        """레이어의 모든 엔티티를 삭제. 삭제된 개수 반환"""
-        if not self.controller.is_running():
-            self.start_cad()
-        count = self.controller.delete_by_layer(layer)
-        self.drawing_state["last_command"] = f"레이어 '{layer}' 삭제"
-        self.drawing_state["last_result"] = f"{count}개 삭제"
-        return count
-
-    def delete_by_window(self, x1, y1, x2, y2, mode="crossing"):
-        """사각형 범위에 걸리는 엔티티를 삭제. 삭제된 개수 반환"""
-        if not self.controller.is_running():
-            self.start_cad()
-        count = self.controller.delete_by_window(x1, y1, x2, y2, mode)
-        self.drawing_state["last_command"] = f"윈도우 삭제 ({x1},{y1})-({x2},{y2})"
-        self.drawing_state["last_result"] = f"{count}개 삭제"
-        return count
-
-    def process_command(self, command: str) -> Dict[str, Any]:
-        """자연어 명령 처리"""
-        if not self.controller.is_running():
-            self.start_cad()
-        # NLP 처리기로 명령 파싱
-        parsed_command = self.nlp_processor.process_command(command)
-        command_type = parsed_command.get("type")
-        try:
-            # 기본 작도 명령 처리
-            if command_type == "draw_line":
-                start_point = parsed_command.get("start_point")
-                end_point = parsed_command.get("end_point")
-                # 색상 매개변수 가져오기
-                color = parsed_command.get("color")
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = self.nlp_processor.extract_color_from_command(command)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                # 선 굵기 매개변수 가져오기
-                lineweight = parsed_command.get("lineweight")
-                result = self.draw_line(start_point, end_point, None, color, lineweight)
-                return {
-                    "success": result is not None,
-                    "message": "직선이 그려졌습니다" if result else "직선 그리기 실패",
-                    "entity_id": result if result else None
-                }
-
-            elif command_type == "draw_circle":
-                center = parsed_command.get("center")
-                radius = parsed_command.get("radius")
-                # 색상 매개변수 가져오기
-                color = parsed_command.get("color")
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = self.nlp_processor.extract_color_from_command(command)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                # 선 굵기 매개변수 가져오기
-                lineweight = parsed_command.get("lineweight")
-                result = self.draw_circle(center, radius, None, color, lineweight)
-                return {
-                    "success": result is not None,
-                    "message": "원이 그려졌습니다" if result else "원 그리기 실패",
-                    "entity_id": result if result else None
-                }
-
-            elif command_type == "draw_arc":
-                center = parsed_command.get("center")
-                radius = parsed_command.get("radius")
-                start_angle = parsed_command.get("start_angle")
-                end_angle = parsed_command.get("end_angle")
-                # 필요한 인자가 모두 존재하고 유효한지 확인
-                if center is None or radius is None or start_angle is None or end_angle is None:
-                    return {
-                        "success": False,
-                        "message": "호 그리기 실패: 필요한 인자 누락",
-                        "error": "필요한 인자 누락: 중심점, 반지름, 시작각도 또는 끝각도"
-                    }
-                # 색상 매개변수 가져오기
-                color = parsed_command.get("color")
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = self.nlp_processor.extract_color_from_command(command)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                # 선 굵기 매개변수 가져오기
-                lineweight = parsed_command.get("lineweight")
-                result = self.draw_arc(center, radius, start_angle, end_angle, None, color, lineweight)
-
-                return {
-                    "success": result is not None,
-                    "message": "호가 그려졌습니다" if result else "호 그리기 실패",
-                    "entity_id": result if result else None
-                }
-
-            elif command_type == "draw_ellipse":
-                center = parsed_command.get("center")
-                major_axis = parsed_command.get("major_axis")
-                minor_axis = parsed_command.get("minor_axis")
-                rotation = parsed_command.get("rotation", 0)  # 기본 회전각도 0
-                # 필요한 인자가 모두 존재하고 유효한지 확인
-                if center is None or major_axis is None or minor_axis is None:
-                    return {
-                        "success": False,
-                        "message": "타원 그리기 실패: 필요한 인자 누락",
-                        "error": "필요한 인자 누락: 중심점, 장축 또는 단축"
-                    }
-                # 색상 매개변수 가져오기
-                color = parsed_command.get("color")
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = self.nlp_processor.extract_color_from_command(command)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                # 선 굵기 매개변수 가져오기
-                lineweight = parsed_command.get("lineweight")
-                result = self.draw_ellipse(center, major_axis, minor_axis, rotation, None, color, lineweight)
-
-                return {
-                    "success": result is not None,
-                    "message": "타원이 그려졌습니다" if result else "타원 그리기 실패",
-                    "entity_id": result if result else None
-                }
-
-            elif command_type == "draw_rectangle":
-                corner1 = parsed_command.get("corner1")
-                corner2 = parsed_command.get("corner2")
-                # 색상 매개변수 가져오기
-                color = parsed_command.get("color")
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = self.nlp_processor.extract_color_from_command(command)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                # 선 굵기 매개변수 가져오기
-                lineweight = parsed_command.get("lineweight")
-                result = self.draw_rectangle(corner1, corner2, None, color, lineweight)
-
-                return {
-                    "success": result is not None,
-                    "message": "사각형이 그려졌습니다" if result else "사각형 그리기 실패",
-                    "entity_id": result if result else None
-                }
-
-            elif command_type == "draw_text":
-                position = parsed_command.get("position")
-                text = parsed_command.get("text")
-                height = parsed_command.get("height", 2.5)
-                rotation = parsed_command.get("rotation", 0)
-                # 색상 매개변수 가져오기
-                color = parsed_command.get("color")
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = self.nlp_processor.extract_color_from_command(command)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                result = self.draw_text(position, text, height, rotation, None, color)
-
-                return {
-                    "success": result is not None,
-                    "message": "텍스트가 추가되었습니다" if result else "텍스트 추가 실패",
-                    "entity_id": result if result else None
-                }
-
-            elif command_type == "draw_hatch":
-                points = parsed_command.get("points")
-                pattern_name = parsed_command.get("pattern_name", "SOLID")
-                scale = parsed_command.get("scale", 1.0)
-                # 필요한 인자가 모두 존재하고 유효한지 확인
-                if points is None or len(points) < 3:
-                    return {
-                        "success": False,
-                        "message": "해치 그리기 실패: 필요한 인자 누락",
-                        "error": "해치 경계는 최소 3개의 점이 필요합니다"
-                    }
-                # 색상 매개변수 가져오기 (인덱스 또는 RGB 값일 수 있음)
-                color = parsed_command.get("color")  # 색상 매개변수 가져오기
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = self.nlp_processor.extract_color_from_command(command)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                result = self.draw_hatch(points, pattern_name, scale, None, color)
-
-                return {
-                    "success": result is not None,
-                    "message": "해치가 그려졌습니다" if result else "해치 그리기 실패",
-                    "entity_id": result if result else None
-                }
-
-            # 치수 처리
-            elif command_type == "add_dimension":
-                start_point = parsed_command.get("start_point")
-                end_point = parsed_command.get("end_point")
-                text_position = parsed_command.get("text_position")
-                result = self.controller.add_dimension(start_point, end_point, text_position)
-                return {
-                    "success": result is not None,
-                    "message": "치수가 추가되었습니다" if result else "치수 추가 실패",
-                    "entity_id": result if result else None
-                }
-
-            elif command_type == "save":
-                file_path = parsed_command.get("file_path")
-                result = self.save_drawing(file_path)
-
-                return {
-                    "success": result,
-                    "message": f"도면이 {file_path}에 저장되었습니다" if result else f"{file_path}에 도면 저장 실패"
-                }
-
-
-            # 레이어 작업 처리
-            elif command_type == "create_layer":
-                layer_name = parsed_command.get("layer_name")
-                color = parsed_command.get("color", 7)  # 기본 흰색
-                result = self.controller.create_layer(layer_name)  # , color
-                return {
-                    "success": result,
-                    "message": f"레이어 {layer_name}이(가) 생성되었습니다" if result else f"레이어 {layer_name} 생성 실패"
-                }
-
+            expanded = cad_reader.expand_blocks(entities, c.doc, c.lib)
         except Exception as e:
-            return {
-                "success": False,
-                "message": f"명령 처리 중 오류 발생: {str(e)}"
-            }
+            logger.warning(f"블록 펼치기 실패, 원본 사용: {e}")
+            expanded = entities
+        return entities, expanded
+
+    entities, expanded = svc.run(job, "preview_drawing", timeout=LONG_TIMEOUT)
+    zoom = a.get("zoom_to")
+    png = cad_reader.render_png(
+        expanded,
+        width=max(200, min(int(a.get("width", 800)), 2000)),
+        height=max(200, min(int(a.get("height", 600)), 2000)),
+        show_labels=bool(a.get("show_labels")),
+        bounds=tuple(float(v) for v in zoom) if zoom else None)
+    return [types.ImageContent(type="image", mimeType="image/png",
+                               data=base64.b64encode(png).decode("ascii")),
+            types.TextContent(type="text", text=cad_reader.summarize(entities))]
+
+
+@tool("list_blocks", "정의된 블록과 속성 태그 목록")
+def t_list_blocks(svc, a):
+    blocks = svc.run(lambda c: c.list_blocks(), "list_blocks")
+    return _dumps(blocks) if blocks else "정의된 블록이 없습니다."
+
+
+# ---------------- 레이어 / 현재값 / 정리 ----------------
+
+@tool("manage_layers",
+      "레이어 관리. action: list(색·켜짐·잠금·엔티티 수) | create | delete(빈 레이어만) | rename | "
+      "set(color/on/frozen/locked/lineweight 변경)",
+      {"action": {"type": "string", "enum": ["list", "create", "delete", "rename", "set"]},
+       "name": {"type": "string"}, "new_name": {"type": "string"}, "color": COLOR,
+       "on": {"type": "boolean"}, "frozen": {"type": "boolean"}, "locked": {"type": "boolean"},
+       "lineweight": LINEWEIGHT}, ["action"])
+def t_manage_layers(svc, a):
+    action = a["action"]
+    r = svc.run(lambda c: c.layer_action(action, a.get("name"), a.get("new_name"), a.get("color"),
+                                         a.get("on"), a.get("frozen"), a.get("locked"),
+                                         a.get("lineweight")),
+                f"manage_layers({action})", timeout=LONG_TIMEOUT, mutating=action != "list")
+    if action == "list":
+        return "\n".join(_dumps(x) for x in r["layers"])
+    return _dumps(r)
+
+
+@tool("set_current",
+      "현재 레이어(CLAYER)·현재 색(CECOLOR) 설정. 테스트나 작업 후 color=BYLAYER로 되돌리는 데 쓴다. "
+      "이 서버의 작도 도구는 현재값과 무관하게 레이어 '0'/BYLAYER가 기본이다",
+      {"layer": {"type": "string"}, "color": COLOR})
+def t_set_current(svc, a):
+    r = svc.run(lambda c: c.set_current(a.get("layer"), a.get("color")), "set_current")
+    return f"현재 레이어: {r['clayer']}, 현재 색: {r['cecolor']}"
+
+
+@tool("purge",
+      "쓰지 않는 항목 정리. kind: all(PURGE ALL) | layers(엔티티 없는 레이어만, 0/Defpoints/현재 "
+      "레이어 제외) | blocks(삽입 안 된 블록 정의)",
+      {"kind": {"type": "string", "enum": ["all", "layers", "blocks"]}})
+def t_purge(svc, a):
+    r = svc.run(lambda c: c.purge(a.get("kind", "all")), "purge", timeout=LONG_TIMEOUT, mutating=True)
+    return (f"정리 완료: 레이어 {len(r['removed_layers'])}개 {r['removed_layers']}, "
+            f"블록 {len(r['removed_blocks'])}개 {r['removed_blocks']}")
+
+
+# ---------------- 문서 / 뷰 / 명령 ----------------
+
+@tool("document",
+      "문서 목록/전환. action: list | new(새 도면) | open(path) | activate(name) | save(이미 저장된 "
+      "문서 덮어쓰기). 전환하면 이후 작업 대상이 바뀐다 (캐디안 탭도 함께 바뀜)",
+      {"action": {"type": "string", "enum": ["list", "new", "open", "activate", "save"]},
+       "name": {"type": "string"}, "path": {"type": "string"}}, ["action"])
+def t_document(svc, a):
+    action = a["action"]
+    r = svc.run(lambda c: c.documents(action, a.get("name"), a.get("path")),
+                f"document({action})", timeout=LONG_TIMEOUT)
+    return _dumps(r)
+
+
+@tool("save_drawing", "현재 도면을 경로에 저장 (저장 전 범위 갱신)",
+      {"file_path": {"type": "string"}}, ["file_path"])
+def t_save_drawing(svc, a):
+    path = a["file_path"]
+    if not os.path.isabs(path):
+        path = os.path.join(CONFIG["output"]["directory"], path)
+    saved = svc.run(lambda c: c.save_drawing(path), "save_drawing", timeout=LONG_TIMEOUT)
+    return f"저장 완료: {saved}"
+
+
+@tool("zoom_extents", "전체 보기 + 재생성(REGEN). 갱신된 EXTMIN/EXTMAX를 돌려준다")
+def t_zoom_extents(svc, a):
+    r = svc.run(lambda c: c.extents(), "zoom_extents")
+    return f"전체 보기 완료: {_dumps(r)}"
+
+
+@tool("send_command",
+      "캐디안 명령줄에 그대로 보낸다 (예: \"_.ZOOM\\n_E\\n\", \"-LAYER ...\"). 끝에 개행이 없으면 "
+      "붙인다. wait초 안에 명령이 안 끝나면(추가 입력 대기) ESC로 취소한다. 전용 도구가 있으면 그걸 쓴다",
+      {"command": {"type": "string"}, "wait": {"type": "number", "description": "기본 5초"}},
+      ["command"])
+def t_send_command(svc, a):
+    wait = float(a.get("wait", 5.0))
+    r = svc.run(lambda c: c.send_command(a["command"], True, wait), "send_command",
+                timeout=wait + 20)
+    return _dumps(r)
+
+
+@tool("undo",
+      "최근 작업 되돌리기. 이 서버의 작도/편집 도구 호출 1번 = 1단계 (사용자가 캐디안에서 직접 한 "
+      "명령도 단계에 포함된다)",
+      {"steps": {"type": "integer", "description": "기본 1"}})
+def t_undo(svc, a):
+    r = svc.run(lambda c: c.undo(a.get("steps", 1)), "undo", timeout=40)
+    return f"되돌리기 {r['steps']}단계: 엔티티 수 변화 {r['entity_delta']:+d}" + \
+        (f" ({r['note']})" if r.get("note") else "")
+
+
+# ---------------- 블록 ----------------
+
+@tool("create_block",
+      "블록(심볼) 정의. entities는 draw_entities와 같은 형식(블록 기준점 상대 좌표), attributes는 "
+      "[{tag,prompt,default,position,height,invisible}]",
+      {"name": {"type": "string"}, "base_point": {"type": "array", "items": {"type": "number"}},
+       "entities": {"type": "array", "items": {"type": "object"}},
+       "attributes": {"type": "array", "items": {"type": "object"}}}, ["name", "entities"])
+def t_create_block(svc, a):
+    r = svc.run(lambda c: c.create_block(a["name"], a["entities"], a.get("attributes"),
+                                         a.get("base_point", (0, 0))),
+                "create_block", timeout=LONG_TIMEOUT, mutating=True)
+    text = f"블록 '{r['block']}' 정의 완료: 도형 {r['entities']}개"
+    if r["errors"]:
+        text += "\n실패: " + "; ".join(r["errors"])
+    return text
+
+
+@tool("insert_block", "블록 배치. attributes={TAG: 값}. 반환: 핸들",
+      {"name": {"type": "string"}, "position": PT, "scale": {"type": "number"},
+       "rotation": {"type": "number"}, "attributes": {"type": "object"}, "layer": LAYER},
+      ["name", "position"])
+def t_insert_block(svc, a):
+    h = svc.run(lambda c: c.insert_block(a["name"], a["position"], a.get("scale", 1.0),
+                                         a.get("rotation", 0.0), a.get("attributes"), a.get("layer")),
+                "insert_block", mutating=True)
+    return f"블록 '{a['name']}' 삽입: {h}"
+
+
+@tool("set_block_attributes", "배치된 블록의 속성값 변경",
+      {"handle": HANDLE, "attributes": {"type": "object"}}, ["handle", "attributes"])
+def t_set_block_attributes(svc, a):
+    n = svc.run(lambda c: c.set_block_attributes(a["handle"], a["attributes"]),
+                "set_block_attributes", mutating=True)
+    return f"핸들 {a['handle']} 속성 {n}개 변경"
+
+
+# ======================================================================
+# 실행
+# ======================================================================
+
+def _summarize_args(args: Dict[str, Any]) -> str:
+    text = _dumps(args)
+    return text if len(text) <= 300 else text[:300] + f"...({len(text)}자)"
+
+
+def _error_result(kind: str, message: str) -> types.CallToolResult:
+    return types.CallToolResult(content=[types.TextContent(type="text", text=f"오류[{kind}]: {message}")],
+                                isError=True)
+
+
+def _with_notices(service: CADService, content: List[Any]) -> List[Any]:
+    notices = service.worker.pop_notices()
+    if notices:
+        content = list(content) + [types.TextContent(type="text",
+                                                     text="\n".join("※ " + n for n in notices))]
+    return content
+
 
 async def main():
-    """메인 진입점 함수"""
     logger.info("CAD MCP 서버 시작")
-
-    # 설정 로드
-    config = Config()
-    cad_service = CADService()
-    server = Server(config.server_name)
-
-    # 핸들러 등록
-    logger.debug("핸들러 등록")
+    service = CADService()
+    server = Server(CONFIG['server']['name'])
 
     @server.list_resources()
     async def handle_list_resources() -> list[types.Resource]:
-        logger.debug("list_resources 요청 처리")
-        return [
-            types.Resource(
-                uri=AnyUrl("drawing://current"),
-                name="현재 CAD 도면",
-                description="현재 CAD 도면의 상태",
-                mimeType="application/json",
-            )
-        ]
+        return [types.Resource(uri=AnyUrl("drawing://current"), name="현재 CAD 도면",
+                               description="마지막 작업과 연결 상태", mimeType="application/json")]
 
     @server.read_resource()
     async def handle_read_resource(uri: AnyUrl) -> str:
-        logger.debug(f"read_resource 요청 처리, URI: {uri}")
-        if uri.scheme != "drawing":
-            logger.error(f"지원하지 않는 URI 스킴: {uri.scheme}")
-            raise ValueError(f"지원하지 않는 URI 스킴: {uri.scheme}")
-
-        path = str(uri).replace("drawing://", "")
-        if not path or path != "current":
-            logger.error(f"알 수 없는 리소스 경로: {path}")
-            raise ValueError(f"알 수 없는 리소스 경로: {path}")
-
-        return json.dumps(cad_service.drawing_state)
-
+        if str(uri) != "drawing://current":
+            raise ValueError(f"알 수 없는 리소스: {uri}")
+        return _dumps({**service.state, "status": service.worker.status()})
 
     @server.list_tools()
     async def handle_list_tools() -> list[types.Tool]:
-        """사용 가능한 도구 목록"""
-        return [
-            types.Tool(
-                name="draw_line",
-                description="CAD에서 직선을 그린다",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "start_point": {
-                            "type": "array",
-                            "description": "시작점 좌표 [x, y, z]",
-                            "items": {"type": "number"},
-                            "minItems": 2,
-                            "maxItems": 3
-                        },
-                        "end_point": {
-                            "type": "array",
-                            "description": "끝점 좌표 [x, y, z]",
-                            "items": {"type": "number"},
-                            "minItems": 2,
-                            "maxItems": 3
-                        },
-                        "layer": {"type": "string", "description": "레이어 이름 (선택)"},
-                        "color": {"type": "string", "description": "색상 이름 (선택)"},
-                        "lineweight": {"type": "number", "description": "선 굵기 (선택)"}
-                    },
-                    "required": ["start_point", "end_point"],
-                },
-            ),
-
-            types.Tool(
-                name="draw_circle",
-                description="CAD에서 원을 그린다",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "center": {
-                            "type": "array",
-                            "description": "중심점 좌표 [x, y, z]",
-                            "items": {"type": "number"},
-                            "minItems": 2,
-                            "maxItems": 3
-                        },
-                        "radius": {"type": "number", "description": "원의 반지름"},
-                        "layer": {"type": "string", "description": "레이어 이름 (선택)"},
-                        "color": {"type": "string", "description": "색상 이름 (선택)"},
-                        "lineweight": {"type": "number", "description": "선 굵기 (선택)"}
-                    },
-                    "required": ["center", "radius"],
-                },
-            ),
-
-            types.Tool(
-                name="draw_arc",
-                description="CAD에서 호를 그린다",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "center": {
-                            "type": "array",
-                            "description": "중심점 좌표 [x, y, z]",
-                            "items": {"type": "number"},
-                            "minItems": 2,
-                            "maxItems": 3
-                        },
-                        "radius": {"type": "number", "description": "호의 반지름"},
-                        "start_angle": {"type": "number", "description": "시작 각도(도)"},
-                        "end_angle": {"type": "number", "description": "끝 각도(도)"},
-                        "layer": {"type": "string", "description": "레이어 이름 (선택)"},
-                        "color": {"type": "string", "description": "색상 이름 (선택)"},
-                        "lineweight": {"type": "number", "description": "선 굵기 (선택)"}
-                    },
-                    "required": ["center", "radius", "start_angle", "end_angle"],
-                },
-            ),
-
-            types.Tool(
-                name="draw_ellipse",
-                description="CAD에서 타원을 그린다",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "center": {
-                            "type": "array",
-                            "description": "타원 중심 좌표 [x, y, z]",
-                            "items": {"type": "number"},
-                            "minItems": 2,
-                            "maxItems": 3
-                        },
-                        "major_axis": {"type": "number", "description": "장축 길이"},
-                        "minor_axis": {"type": "number", "description": "단축 길이"},
-                        "rotation": {"type": "number", "description": "회전 각도(도) (선택)"},
-                        "layer": {"type": "string", "description": "레이어 이름 (선택)"},
-                        "color": {"type": "string", "description": "색상 이름 (선택)"},
-                        "lineweight": {"type": "number", "description": "선 굵기 (선택)"}
-                    },
-                    "required": ["center", "major_axis", "minor_axis"],
-                },
-            ),
-
-            types.Tool(
-                name="draw_polyline",
-                description="CAD에서 폴리라인을 그린다",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "points": {
-                            "type": "array",
-                            "description": "점 집합 [[x1, y1, z1], [x2, y2, z2], ...]",
-                            "items": {
-                                "type": "array",
-                                "items": {"type": "number"},
-                                "minItems": 2,
-                                "maxItems": 3
-                            },
-                            "minItems": 2
-                        },
-                        "closed": {"type": "boolean", "description": "닫힘 여부"},
-                        "layer": {"type": "string", "description": "레이어 이름 (선택)"},
-                        "color": {"type": "string", "description": "색상 이름 (선택)"},
-                        "lineweight": {"type": "number", "description": "선 굵기 (선택)"}
-                    },
-                    "required": ["points"],
-                },
-            ),
-
-            types.Tool(
-                name="draw_rectangle",
-                description="CAD에서 사각형을 그린다",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "corner1": {
-                            "type": "array",
-                            "description": "첫 번째 모서리 좌표 [x, y, z]",
-                            "items": {"type": "number"},
-                            "minItems": 2,
-                            "maxItems": 3
-                        },
-                        "corner2": {
-                            "type": "array",
-                            "description": "두 번째 모서리 좌표 [x, y, z]",
-                            "items": {"type": "number"},
-                            "minItems": 2,
-                            "maxItems": 3
-                        },
-                        "layer": {"type": "string", "description": "레이어 이름 (선택)"},
-                        "color": {"type": "string", "description": "색상 이름 (선택)"},
-                        "lineweight": {"type": "number", "description": "선 굵기 (선택)"}
-                    },
-                    "required": ["corner1", "corner2"],
-                },
-            ),
-
-            types.Tool(
-                name="draw_text",
-                description="CAD에 텍스트를 추가한다",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "position": {
-                            "type": "array",
-                            "description": "삽입점 좌표 [x, y, z]",
-                            "items": {"type": "number"},
-                            "minItems": 2,
-                            "maxItems": 3
-                        },
-                        "text": {"type": "string", "description": "텍스트 내용"},
-                        "height": {"type": "number", "description": "텍스트 높이"},
-                        "rotation": {"type": "number", "description": "회전 각도(도)"},
-                        "layer": {"type": "string", "description": "레이어 이름 (선택)"},
-                        "color": {"type": "string", "description": "색상 이름 (선택)"}
-                    },
-                    "required": ["position", "text"],
-                },
-            ),
-           
-            types.Tool(
-                name="draw_hatch",
-                description="CAD에서 해치(채우기)를 그린다",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "points": {
-                            "type": "array",
-                            "description": "채우기 경계 점 집합 [[x1, y1, z1], [x2, y2, z2], ...]",
-                            "items": {
-                                "type": "array",
-                                "items": {"type": "number"},
-                                "minItems": 2,
-                                "maxItems": 3
-                            },
-                            "minItems": 3
-                        },
-                        "pattern_name": {"type": "string", "description": "채우기 패턴 이름 (선택, 기본값 SOLID)"},
-                        "scale": {"type": "number", "description": "채우기 패턴 비율 (선택, 기본값 1.0)"},
-                        "layer": {"type": "string", "description": "레이어 이름 (선택)"},
-                        "color": {"type": "string", "description": "색상 이름 (선택)"}
-                    },
-                    "required": ["points"],
-                },
-            ),
-
-            types.Tool(
-                name="add_dimension",
-                description="CAD에 선형 치수를 추가한다",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "start_point": {"type": "array", "description": "시작점 좌표 [x, y, z]", "items": {"type": "number"}, "minItems": 2, "maxItems": 3},
-                        "end_point": {"type": "array", "description": "끝점 좌표 [x, y, z]", "items": {"type": "number"}, "minItems": 2, "maxItems": 3},
-                        "text_position": {"type": "array", "description": "텍스트 위치 좌표 [x, y, z], 선택", "items": {"type": "number"}, "minItems": 2, "maxItems": 3},
-                        "textheight": {"type": "number", "description": "치수 문자 높이, 선택"},
-                        "layer": {"type": "string", "description": "레이어 이름, 선택"},
-                        "color": {"type": "string", "description": "색상 이름, 선택"}
-                    },
-                    "required": ["start_point", "end_point"],
-                },
-            ),
-
-            types.Tool(
-                name="save_drawing",
-                description="현재 도면을 저장한다",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "file_path": {"type": "string", "description": "저장 경로"}
-                    },
-                    "required": ["file_path"],
-                },
-            ),
-
-            types.Tool(
-                name="process_command",
-                description="자연어 명령을 처리하여 CAD 작업으로 변환한다",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string", "description": "자연어 명령"}
-                    },
-                    "required": ["command"],
-                },
-            ),
-
-            # ---------------- 읽기 도구 ----------------
-            types.Tool(
-                name="cad_status",
-                description=(
-                    "CAD 연결이 살아 있는지 빠르게 확인한다. CAD가 멈춰 있어도 "
-                    "즉시 반환하므로, 다른 도구가 응답하지 않을 때 먼저 호출한다."
-                ),
-                inputSchema={"type": "object", "properties": {}},
-            ),
-
-            types.Tool(
-                name="cad_reconnect",
-                description=(
-                    "막힌 COM 연결을 버리고 캐디안에 다시 연결한다. cad_status가 "
-                    "responsive=false를 보고한 뒤, 사용자가 캐디안에서 ESC를 눌러 "
-                    "명령을 취소한 다음에 호출한다."
-                ),
-                inputSchema={"type": "object", "properties": {}},
-            ),
-
-            types.Tool(
-                name="get_drawing_info",
-                description=(
-                    "현재 도면의 전역 정보를 읽는다. 엔티티 개수, 도면 범위"
-                    "(EXTMIN/EXTMAX), 레이어 목록, 현재 레이어, 단위. "
-                    "도형을 그리기 전에 현재 상태를 확인하거나, 그린 뒤 "
-                    "범위가 의도대로인지 검증할 때 사용."
-                ),
-                inputSchema={"type": "object", "properties": {}},
-            ),
-
-            types.Tool(
-                name="list_entities",
-                description=(
-                    "도면에 있는 엔티티 목록을 읽는다. 각 항목은 종류"
-                    "(ObjectName), 핸들, 레이어, 색상을 포함한다. 그린 결과의 "
-                    "숫자를 검산하거나 특정 도형을 찾을 때 사용. 기본으로는 "
-                    "좌표 배열(폴리라인 points, 해치 loops)을 빼고 요약만 "
-                    "반환한다 — 엔티티가 많으면 좌표까지 포함한 응답이 통째로 "
-                    "실패할 수 있다. 전체 도면이 의도대로 그려졌는지 눈으로 "
-                    "확인하려면 이 도구로 다 덤프하지 말고 preview_drawing "
-                    "(이미지, 엔티티 수와 무관하게 비용 고정)을 먼저 쓰고, "
-                    "이 도구는 layer/entity_type으로 좁힌 소수 엔티티의 정확한 "
-                    "좌표가 필요할 때만 include_geometry=true와 함께 쓴다."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "layer": {"type": "string",
-                                  "description": "이 레이어의 엔티티만 (생략 시 전체)"},
-                        "entity_type": {"type": "string",
-                                        "description": "종류 필터. 예: Circle, Line, Text, Polyline"},
-                        "limit": {"type": "integer",
-                                  "description": "최대 반환 개수 (기본 100)"},
-                        "include_geometry": {
-                            "type": "boolean",
-                            "description": (
-                                "true면 points/loops 좌표 배열까지 포함한 "
-                                "전체 정보를 반환 (기본 false, 요약만)"
-                            ),
-                        },
-                    },
-                },
-            ),
-
-            types.Tool(
-                name="preview_drawing",
-                description=(
-                    "현재 도면을 PNG 이미지로 렌더링해서 반환한다. 도면을 눈으로 "
-                    "확인해 도형 배치, 겹침, 축척 오류를 찾을 때 사용. 이미지 "
-                    "하나의 비용은 엔티티 수와 무관하게 거의 고정이므로, 배치 "
-                    "작도 후 전체가 의도대로 그려졌는지 확인할 때는 "
-                    "list_entities로 다 덤프하는 대신 이 도구를 우선 쓴다. "
-                    "zoom_to로 특정 영역만 확대할 수 있고, show_labels로 각 "
-                    "엔티티의 핸들을 표시할 수 있다."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "width": {"type": "integer", "description": "이미지 폭 (기본 800, 최대 2000)"},
-                        "height": {"type": "integer", "description": "이미지 높이 (기본 600, 최대 2000)"},
-                        "show_labels": {"type": "boolean",
-                                        "description": "엔티티 핸들 표시 (기본 false)"},
-                        "zoom_to": {
-                            "type": "array",
-                            "items": {"type": "number"},
-                            "description": "확대할 영역 [x0, y0, x1, y1] (생략 시 전체)"
-                        },
-                    },
-                },
-            ),
-
-            # ---------------- 편집 도구 ----------------
-            types.Tool(
-                name="edit_entity",
-                description=(
-                    "이미 그려진 도형을 핸들로 지목해 편집한다. 핸들은 "
-                    "list_entities로 얻는다. operation에 따라 필요한 인자가 다르다: "
-                    "move는 offset, rotate는 base_point와 angle, scale은 "
-                    "base_point와 factor, copy는 offset(선택), mirror는 point1과 "
-                    "point2, offset은 distance, delete는 추가 인자 없음."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "handle": {"type": "string", "description": "대상 엔티티 핸들"},
-                        "operation": {
-                            "type": "string",
-                            "enum": ["move", "rotate", "scale", "copy",
-                                     "mirror", "offset", "delete"],
-                        },
-                        "offset": {"type": "array", "items": {"type": "number"},
-                                   "description": "이동/복사 변위 [dx, dy]"},
-                        "base_point": {"type": "array", "items": {"type": "number"},
-                                       "description": "회전/축척 기준점 [x, y]"},
-                        "angle": {"type": "number", "description": "회전 각도(도)"},
-                        "factor": {"type": "number", "description": "축척 배율"},
-                        "point1": {"type": "array", "items": {"type": "number"},
-                                   "description": "대칭축 시작점"},
-                        "point2": {"type": "array", "items": {"type": "number"},
-                                   "description": "대칭축 끝점"},
-                        "make_copy": {"type": "boolean",
-                                      "description": "대칭 시 원본 유지 (기본 true)"},
-                        "distance": {"type": "number",
-                                     "description": "평행복사 거리. 부호가 방향"},
-                    },
-                    "required": ["handle", "operation"],
-                },
-            ),
-
-            types.Tool(
-                name="array_entity",
-                description=(
-                    "도형을 배열 복제한다. mode가 polar면 중심점 기준 원형 배열"
-                    "(count, center, included_angle), rectangular면 격자 배열"
-                    "(rows, columns, row_spacing, column_spacing). "
-                    "볼트홀 배치나 규칙적 반복에 쓴다."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "handle": {"type": "string"},
-                        "mode": {"type": "string", "enum": ["polar", "rectangular"]},
-                        "count": {"type": "integer",
-                                  "description": "원형 배열 총 개수(원본 포함)"},
-                        "center": {"type": "array", "items": {"type": "number"},
-                                   "description": "원형 배열 중심 [x, y]"},
-                        "included_angle": {"type": "number",
-                                           "description": "원형 배열 전체 각도(도). 기본 360"},
-                        "rotate_objects": {"type": "boolean",
-                                           "description": "복제본을 함께 회전 (기본 true)"},
-                        "rows": {"type": "integer"},
-                        "columns": {"type": "integer"},
-                        "row_spacing": {"type": "number"},
-                        "column_spacing": {"type": "number"},
-                    },
-                    "required": ["handle", "mode"],
-                },
-            ),
-
-            # ---------------- 블록 도구 ----------------
-            types.Tool(
-                name="list_blocks",
-                description=(
-                    "정의된 블록 목록과 각 블록의 속성 태그를 보여준다. "
-                    "블록을 삽입하기 전에 이름과 태그를 확인할 때 사용."
-                ),
-                inputSchema={"type": "object", "properties": {}},
-            ),
-
-            types.Tool(
-                name="create_block",
-                description=(
-                    "재사용할 블록(심볼)을 정의한다. entities에 도형 목록을, "
-                    "attributes에 인스턴스마다 값을 바꿀 속성 태그를 넣는다. "
-                    "좌표는 블록 기준점(base_point) 기준의 상대 좌표로 쓴다. "
-                    "정의해 두면 insert_block으로 위치와 속성값만 바꿔 반복 배치할 수 "
-                    "있고, 나중에 블록 정의만 고치면 모든 인스턴스가 함께 바뀐다. "
-                    "entities의 각 항목은 type이 line, circle, arc, ellipse, "
-                    "rectangle, polyline, text 중 하나이고 해당 좌표 키를 갖는다."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "블록 이름"},
-                        "base_point": {"type": "array", "items": {"type": "number"},
-                                       "description": "삽입 기준점 [x, y] (기본 [0,0])"},
-                        "entities": {
-                            "type": "array",
-                            "description": (
-                                "도형 목록. 예: "
-                                "[{\"type\":\"rectangle\",\"corner1\":[0,0],"
-                                "\"corner2\":[40,20],\"color\":2}, "
-                                "{\"type\":\"circle\",\"center\":[20,10],\"radius\":5}, "
-                                "{\"type\":\"text\",\"position\":[2,22],"
-                                "\"text\":\"고정문구\",\"height\":4}]"
-                            ),
-                            "items": {"type": "object"},
-                        },
-                        "attributes": {
-                            "type": "array",
-                            "description": (
-                                "인스턴스마다 바뀌는 속성. 예: "
-                                "[{\"tag\":\"NAME\",\"prompt\":\"장비명\","
-                                "\"default\":\"미지정\",\"position\":[2,6],"
-                                "\"height\":5}]"
-                            ),
-                            "items": {"type": "object"},
-                        },
-                    },
-                    "required": ["name", "entities"],
-                },
-            ),
-
-            types.Tool(
-                name="insert_block",
-                description=(
-                    "정의된 블록을 도면에 배치한다. attributes로 이 인스턴스만의 "
-                    "속성값을 지정한다. 예: attributes={\"NAME\": \"라우터\"}. "
-                    "삽입된 인스턴스의 핸들을 반환하므로 나중에 편집할 수 있다."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "블록 이름"},
-                        "position": {"type": "array", "items": {"type": "number"},
-                                     "description": "삽입 위치 [x, y]"},
-                        "scale": {"type": "number", "description": "축척 (기본 1.0)"},
-                        "rotation": {"type": "number", "description": "회전 각도(도)"},
-                        "attributes": {"type": "object",
-                                       "description": "속성 태그별 값. 예: {\"NAME\": \"라우터\"}"},
-                        "layer": {"type": "string", "description": "배치할 레이어"},
-                    },
-                    "required": ["name", "position"],
-                },
-            ),
-
-            types.Tool(
-                name="set_block_attributes",
-                description=(
-                    "이미 배치된 블록 인스턴스의 속성값을 바꾼다. 핸들은 "
-                    "list_entities로 얻는다. 라벨만 수정할 때 사용."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "handle": {"type": "string"},
-                        "attributes": {"type": "object",
-                                       "description": "속성 태그별 새 값"},
-                    },
-                    "required": ["handle", "attributes"],
-                },
-            ),
-
-            # ---------------- 배치 작도 / 삭제 ----------------
-            types.Tool(
-                name="draw_entities",
-                description=(
-                    "여러 도형을 한 번의 호출로 그린다. entities의 각 항목은 "
-                    "create_block과 같은 형식: type이 line, circle, arc, "
-                    "ellipse, rectangle, polyline, text 중 하나이고 해당 좌표 "
-                    "키와 layer/color/lineweight를 가질 수 있다. 도형 하나마다 "
-                    "따로 호출을 왕복하는 대신, 자료(그리드/치수/실명 등)에서 "
-                    "뽑아낸 도형 목록을 한 번에 넘길 때 사용한다. 반환값은 "
-                    "entities와 같은 순서의 핸들 목록이며, 실패한 항목은 "
-                    "null로 남는다."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "entities": {
-                            "type": "array",
-                            "description": (
-                                "도형 목록. 예: "
-                                "[{\"type\":\"line\",\"start\":[0,0],\"end\":[40,0],"
-                                "\"layer\":\"외벽\"}, "
-                                "{\"type\":\"circle\",\"center\":[20,10],\"radius\":5}, "
-                                "{\"type\":\"text\",\"position\":[2,22],"
-                                "\"text\":\"101\",\"height\":4}]"
-                            ),
-                            "items": {"type": "object"},
-                        },
-                        "verbose": {
-                            "type": "boolean",
-                            "description": (
-                                "true면 항목마다 핸들을 한 줄씩 나열 (기본 "
-                                "false, 성공/실패 개수와 실패 항목만 표시). "
-                                "이후에 개별 핸들을 수정/삭제할 계획이면 켠다."
-                            ),
-                        },
-                    },
-                    "required": ["entities"],
-                },
-            ),
-
-            types.Tool(
-                name="delete_by_layer",
-                description=(
-                    "지정한 레이어의 모든 엔티티를 삭제한다. 자료가 바뀌어 "
-                    "도면을 다시 그려야 할 때, 이전에 그린 것을 레이어 단위로 "
-                    "한 번에 지우는 용도. 삭제된 개수를 반환한다."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "layer": {"type": "string", "description": "삭제할 레이어 이름"},
-                    },
-                    "required": ["layer"],
-                },
-            ),
-
-            types.Tool(
-                name="delete_by_window",
-                description=(
-                    "사각형 범위 [x1,y1]-[x2,y2]에 걸리는 엔티티를 삭제한다. "
-                    "mode가 crossing(기본)이면 범위와 조금이라도 겹치는 것까지, "
-                    "inside면 범위 안에 완전히 들어온 것만 지운다. 특정 구역만 "
-                    "다시 그릴 때 레이어 구분 없이 그 구역만 지우는 용도. "
-                    "삭제된 개수를 반환한다."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "x1": {"type": "number"},
-                        "y1": {"type": "number"},
-                        "x2": {"type": "number"},
-                        "y2": {"type": "number"},
-                        "mode": {"type": "string", "enum": ["crossing", "inside"],
-                                 "description": "crossing(기본) 또는 inside"},
-                    },
-                    "required": ["x1", "y1", "x2", "y2"],
-                },
-            ),
-        ]
+        return [types.Tool(name=t.name, description=t.description, inputSchema=t.schema)
+                for t in TOOLS.values()]
 
     @server.call_tool()
-    async def handle_call_tool(
-        name: str, arguments: dict[str, Any] | None
-    ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        """도구 실행 요청 처리"""
+    async def handle_call_tool(name: str, arguments: dict[str, Any] | None):
+        spec = TOOLS.get(name)
+        if spec is None:
+            return _error_result("UNKNOWN_TOOL", f"알 수 없는 도구: {name}")
+        args = arguments or {}
+        t0 = time.monotonic()
+        logger.info(f"도구 시작: {name} {_summarize_args(args)}")
+        status = "실패"
         try:
-            # 읽기 도구는 인자가 없어도 정상이다
-            READ_ONLY_TOOLS = ("get_drawing_info", "list_entities", "preview_drawing",
-                               "list_blocks", "cad_status", "cad_reconnect")
-            if not arguments:
-                if name not in READ_ONLY_TOOLS:
-                    raise ValueError("인자가 없습니다")
-                arguments = {}
-
-            if name == "draw_line":
-                start_point = arguments.get("start_point")
-                end_point = arguments.get("end_point")
-                layer = arguments.get("layer")
-                color = arguments.get("color") 
-                lineweight = arguments.get("lineweight")
-                
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = cad_service.nlp_processor.extract_color_from_command(color)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                
-                if not start_point or not end_point:
-                    raise ValueError("시작점 또는 끝점 좌표가 없습니다")
-                
-                
-                result = cad_service.draw_line(start_point, end_point, layer, color, lineweight)
-                return [types.TextContent(type="text", text=str(result))]
-
-            elif name == "draw_circle":
-                center = arguments.get("center")
-                radius = arguments.get("radius")
-                layer = arguments.get("layer")
-                color = arguments.get("color")
-                lineweight = arguments.get("lineweight")
-                
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = cad_service.nlp_processor.extract_color_from_command(color)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                
-                if not center or radius is None:
-                    raise ValueError("중심점 좌표 또는 반지름이 없습니다")
-                
-                
-                result = cad_service.draw_circle(center, radius, layer, color, lineweight)
-                return [types.TextContent(type="text", text=str(result))]
-
-            elif name == "draw_arc":
-                center = arguments.get("center")
-                radius = arguments.get("radius")
-                start_angle = arguments.get("start_angle")
-                end_angle = arguments.get("end_angle")
-                layer = arguments.get("layer")
-                color = arguments.get("color")
-                lineweight = arguments.get("lineweight")
-                
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = cad_service.nlp_processor.extract_color_from_command(color)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                
-                # 각 인자를 개별적으로 검사해 구체적인 오류 메시지를 제공
-                error_msgs = []
-                if not center:
-                    error_msgs.append("중심점 좌표")
-                if radius is None:
-                    error_msgs.append("반지름")
-                if start_angle is None:
-                    error_msgs.append("시작 각도")
-                if end_angle is None:
-                    error_msgs.append("끝 각도")
-                
-                if error_msgs:
-                    raise ValueError(f"필요한 인자 누락: {', '.join(error_msgs)}")                
-                
-                result = cad_service.draw_arc(center, radius, start_angle, end_angle, layer, color, lineweight)
-                return [types.TextContent(type="text", text=str(result))]
-
-            elif name == "draw_ellipse":
-                center = arguments.get("center")
-                major_axis = arguments.get("major_axis")
-                minor_axis = arguments.get("minor_axis")
-                rotation = arguments.get("rotation")
-                layer = arguments.get("layer")
-                color = arguments.get("color")
-                lineweight = arguments.get("lineweight")
-                
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = cad_service.nlp_processor.extract_color_from_command(color)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                
-                # 각 인자를 개별적으로 검사해 구체적인 오류 메시지를 제공
-                error_msgs = []
-                if not center:
-                    error_msgs.append("중심점 좌표")
-                if major_axis is None:
-                    error_msgs.append("장축")
-                if minor_axis is None:
-                    error_msgs.append("단축")
-                
-                if error_msgs:
-                    raise ValueError(f"필요한 인자 누락: {', '.join(error_msgs)}")
-                
-                result = cad_service.draw_ellipse(center, major_axis, minor_axis, rotation, layer, color, lineweight)
-                return [types.TextContent(type="text", text=str(result))]
-
-            elif name == "draw_polyline":
-                points = arguments.get("points")
-                closed = arguments.get("closed", False)
-                layer = arguments.get("layer")
-                color = arguments.get("color")
-                lineweight = arguments.get("lineweight")
-                
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = cad_service.nlp_processor.extract_color_from_command(color)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                
-                if not points or len(points) < 2:
-                    raise ValueError("점 집합이 없거나 점 개수가 부족합니다")
-                
-                result = cad_service.draw_polyline(points, closed, layer, color, lineweight)
-                return [types.TextContent(type="text", text=str(result))]
-
-            elif name == "draw_rectangle":
-                corner1 = arguments.get("corner1")
-                corner2 = arguments.get("corner2")
-                layer = arguments.get("layer")
-                color = arguments.get("color")
-                lineweight = arguments.get("lineweight")
-                
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = cad_service.nlp_processor.extract_color_from_command(color)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                
-                if not corner1 or not corner2:
-                    raise ValueError("모서리 좌표가 없습니다")
-                
-                result = cad_service.draw_rectangle(corner1, corner2, layer, color, lineweight)
-                return [types.TextContent(type="text", text=str(result))]
-
-
-            elif name == "draw_text":
-                position = arguments.get("position")
-                text = arguments.get("text")
-                height = arguments.get("height", 2.5)
-                rotation = arguments.get("rotation", 0)
-                layer = arguments.get("layer")
-                color = arguments.get("color")
-                
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = cad_service.nlp_processor.extract_color_from_command(color)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                
-                if not position or not text:
-                    raise ValueError("삽입점 좌표 또는 텍스트 내용이 없습니다")
-                
-                result = cad_service.draw_text(position, text, height, rotation, layer, color)
-                return [types.TextContent(type="text", text=str(result))]
-
-
-            elif name == "draw_hatch":
-                points = arguments.get("points")
-                pattern_name = arguments.get("pattern_name", "SOLID")
-                scale = arguments.get("scale", 1.0)
-                layer = arguments.get("layer")
-                color = arguments.get("color")
-                
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = cad_service.nlp_processor.extract_color_from_command(color)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-                
-                if not points or len(points) < 3:
-                    raise ValueError("점 집합이 없거나 점 개수가 부족합니다. 채우기 경계는 최소 3개의 점이 필요합니다")
-                
-                result = cad_service.draw_hatch(points, pattern_name, scale, layer, color)
-                return [types.TextContent(type="text", text=str(result))]
-
-            elif name == "save_drawing":
-                file_path = arguments.get("file_path")
-                
-                if not file_path:
-                    raise ValueError("저장 경로가 없습니다")
-                
-                result = cad_service.save_drawing(file_path)
-                return [types.TextContent(type="text", text=str(result))]
-
-            elif name == "add_dimension":
-                start_point = arguments.get("start_point")
-                end_point = arguments.get("end_point")
-                text_position = arguments.get("text_position")
-                layer = arguments.get("layer")
-                color = arguments.get("color")
-                textheight = arguments.get("textheight")                
-
-                # 명령에서 색상 이름을 추출해 RGB 값으로 변환 시도
-                color_rgb = cad_service.nlp_processor.extract_color_from_command(color)
-                if color_rgb is not None:
-                    color = color_rgb  # 명령에서 추출한 색상을 우선 사용
-
-                # 각 인자를 개별적으로 검사해 구체적인 오류 메시지를 제공
-                error_msgs = []
-                if not start_point:
-                    error_msgs.append("시작점 좌표")
-                if not end_point:
-                    error_msgs.append("끝점 좌표")
-
-                if error_msgs:
-                    raise ValueError(f"필요한 인자 누락: {', '.join(error_msgs)}")                
-
-                result = cad_service.add_dimension(start_point, end_point, text_position, textheight, layer, color)
-                return [types.TextContent(type="text", text=str(result))]
-
-            elif name == "process_command":
-                command = arguments.get("command")                
-
-                if not command:
-                    raise ValueError("명령이 없습니다")
-
-                result = cad_service.process_command(command)
-                return [types.TextContent(type="text", text=str(result))]
-
-            # ---------------- 읽기 도구 ----------------
-            elif name == "cad_status":
-                status = cad_service.cad_status()
-                return [types.TextContent(
-                    type="text",
-                    text=json.dumps(status, ensure_ascii=False, indent=2))]
-
-            elif name == "cad_reconnect":
-                status = cad_service.reconnect()
-                return [types.TextContent(
-                    type="text",
-                    text="재연결 시도 결과:\n"
-                         + json.dumps(status, ensure_ascii=False, indent=2))]
-
-            elif name == "get_drawing_info":
-                info = cad_service.get_drawing_info()
-                return [types.TextContent(
-                    type="text",
-                    text=json.dumps(info, ensure_ascii=False, indent=2))]
-
-            elif name == "list_entities":
-                entities, total = cad_service.list_entities(
-                    layer=arguments.get("layer"),
-                    entity_type=arguments.get("entity_type"),
-                    limit=arguments.get("limit", 100),
-                    include_geometry=arguments.get("include_geometry", False))
-
-                lines = [f"조건에 맞는 엔티티 {total}개"
-                         + (f" (아래는 {len(entities)}개만 표시)"
-                            if len(entities) < total else "")]
-                for e in entities:
-                    lines.append(json.dumps(e, ensure_ascii=False))
-                return [types.TextContent(type="text", text="\n".join(lines))]
-
-            elif name == "preview_drawing":
-                png, summary = cad_service.preview_drawing(
-                    width=arguments.get("width", 800),
-                    height=arguments.get("height", 600),
-                    show_labels=arguments.get("show_labels", False),
-                    zoom_to=arguments.get("zoom_to"))
-
-                return [
-                    types.ImageContent(
-                        type="image",
-                        mimeType="image/png",
-                        data=base64.b64encode(png).decode("ascii")),
-                    types.TextContent(type="text", text=summary),
-                ]
-
-            # ---------------- 편집 / 블록 ----------------
-            elif name == "edit_entity":
-                handle = arguments.get("handle")
-                operation = arguments.get("operation")
-                if not handle or not operation:
-                    raise ValueError("handle과 operation은 필수입니다")
-
-                extras = {k: v for k, v in arguments.items()
-                          if k not in ("handle", "operation")}
-                result = cad_service.edit_entity(handle, operation, **extras)
-
-                if result is False:
-                    text = f"편집 실패: {operation} (핸들 {handle})"
-                elif isinstance(result, str):
-                    text = f"복사 완료. 새 핸들: {result}"
-                else:
-                    text = f"편집 완료: {operation} (핸들 {handle})"
-                return [types.TextContent(type="text", text=text)]
-
-            elif name == "array_entity":
-                handle = arguments.get("handle")
-                mode = arguments.get("mode")
-                if not handle or not mode:
-                    raise ValueError("handle과 mode는 필수입니다")
-
-                extras = {k: v for k, v in arguments.items()
-                          if k not in ("handle", "mode")}
-                ok = cad_service.array_entity(handle, mode, **extras)
-                return [types.TextContent(
-                    type="text",
-                    text=("배열 복제 완료" if ok else "배열 복제 실패")
-                         + f" ({mode}, 핸들 {handle})")]
-
-            elif name == "list_blocks":
-                blocks = cad_service.list_blocks()
-                if not blocks:
-                    text = "정의된 블록이 없습니다."
-                else:
-                    text = json.dumps(blocks, ensure_ascii=False, indent=2)
-                return [types.TextContent(type="text", text=text)]
-
-            elif name == "create_block":
-                block_name = arguments.get("name")
-                entities = arguments.get("entities")
-                if not block_name or not entities:
-                    raise ValueError("name과 entities는 필수입니다")
-
-                ok = cad_service.create_block(
-                    block_name, entities,
-                    arguments.get("attributes"),
-                    arguments.get("base_point", (0, 0)))
-                return [types.TextContent(
-                    type="text",
-                    text=(f"블록 '{block_name}' 정의 완료" if ok
-                          else f"블록 '{block_name}' 정의 실패 (이미 존재하는지 확인)"))]
-
-            elif name == "insert_block":
-                block_name = arguments.get("name")
-                position = arguments.get("position")
-                if not block_name or not position:
-                    raise ValueError("name과 position은 필수입니다")
-
-                handle = cad_service.insert_block(
-                    block_name, position,
-                    arguments.get("scale", 1.0),
-                    arguments.get("rotation", 0.0),
-                    arguments.get("attributes"),
-                    arguments.get("layer"))
-                return [types.TextContent(
-                    type="text",
-                    text=(f"블록 '{block_name}' 삽입 완료. 핸들: {handle}" if handle
-                          else f"블록 '{block_name}' 삽입 실패"))]
-
-            elif name == "set_block_attributes":
-                handle = arguments.get("handle")
-                attributes = arguments.get("attributes")
-                if not handle or not attributes:
-                    raise ValueError("handle과 attributes는 필수입니다")
-
-                ok = cad_service.set_block_attributes(handle, attributes)
-                return [types.TextContent(
-                    type="text",
-                    text=(f"핸들 {handle} 속성 변경 완료" if ok
-                          else f"핸들 {handle} 속성 변경 실패 (태그 이름 확인)"))]
-
-            # ---------------- 배치 작도 / 삭제 ----------------
-            elif name == "draw_entities":
-                entities = arguments.get("entities")
-                if not entities:
-                    raise ValueError("entities는 필수입니다")
-
-                handles = cad_service.draw_entities(entities)
-                ok = sum(1 for h in handles if h)
-                lines = [f"배치 작도: {len(entities)}개 중 {ok}개 성공"]
-
-                if arguments.get("verbose", False):
-                    for i, h in enumerate(handles):
-                        lines.append(f"  [{i}] {h if h else '실패'}")
-                else:
-                    failed = [i for i, h in enumerate(handles) if not h]
-                    if failed:
-                        lines.append(f"실패한 인덱스: {failed}")
-                    if ok:
-                        lines.append("개별 핸들이 필요하면 verbose=true로 다시 "
-                                     "호출하거나 list_entities로 조회하세요.")
-
-                return [types.TextContent(type="text", text="\n".join(lines))]
-
-            elif name == "delete_by_layer":
-                layer = arguments.get("layer")
-                if not layer:
-                    raise ValueError("layer는 필수입니다")
-
-                count = cad_service.delete_by_layer(layer)
-                return [types.TextContent(
-                    type="text",
-                    text=f"레이어 '{layer}' 엔티티 {count}개 삭제 완료")]
-
-            elif name == "delete_by_window":
-                x1, y1 = arguments.get("x1"), arguments.get("y1")
-                x2, y2 = arguments.get("x2"), arguments.get("y2")
-                mode = arguments.get("mode", "crossing")
-                if None in (x1, y1, x2, y2):
-                    raise ValueError("x1, y1, x2, y2는 필수입니다")
-
-                count = cad_service.delete_by_window(x1, y1, x2, y2, mode)
-                return [types.TextContent(
-                    type="text",
-                    text=f"윈도우 ({x1},{y1})-({x2},{y2}) {mode}: {count}개 삭제 완료")]
-
-            else:
-                raise ValueError(f"알 수 없는 도구: {name}")
-
-        except cad_worker.CADBusy as e:
-            logger.error(f"CAD 응답 없음: {e}")
-            return [types.TextContent(
-                type="text",
-                text=(f"CAD가 응답하지 않습니다.\n\n{e}\n\n"
-                      "cad_status 도구로 상태를 확인하고, 사용자에게 캐디안 창에서 "
-                      "ESC를 두어 번 누르도록 안내한 뒤 cad_reconnect를 호출하세요."))]
-
+            result = await asyncio.wait_for(asyncio.to_thread(spec.handler, service, args),
+                                            timeout=HARD_TIMEOUT)
+            if isinstance(result, str):
+                result = [types.TextContent(type="text", text=result)]
+            status = "성공"
+            return _with_notices(service, result)
+        except asyncio.TimeoutError:
+            return _error_result("TIMEOUT", f"서버 처리 시간이 {HARD_TIMEOUT:.0f}초를 넘었습니다. "
+                                            "cad_status로 상태를 확인하세요.")
+        except CADBusy as e:
+            return _error_result("CAD_BUSY", str(e))
+        except KeyError as e:
+            return _error_result("INVALID_ARGS", f"필수 인자 누락: {e}")
+        except (ValueError, TypeError) as e:
+            return _error_result("INVALID_ARGS", str(e))
+        except CADError as e:
+            return _error_result("CAD_ERROR", str(e))
         except Exception as e:
-            return [types.TextContent(type="text", text=f"오류: {str(e)}")]
+            logger.exception(f"도구 {name} 처리 중 예외")
+            return _error_result("COM_ERROR", describe_error(e))
+        finally:
+            logger.info(f"도구 종료: {name} {status} ({time.monotonic() - t0:.2f}s)")
 
     @server.list_prompts()
     async def handle_list_prompts() -> list[types.Prompt]:
-        logger.debug("list_prompts 요청 처리")
-        return [
-            types.Prompt(
-                name="cad-assistant",
-                description="자연어로 CAD를 제어하는 어시스턴트",
-                arguments=[],
-            )
-        ]
+        return [types.Prompt(name="cad-assistant",
+                             description="자연어로 CAD를 제어하는 도우미", arguments=[])]
 
     @server.get_prompt()
     async def handle_get_prompt(name: str, arguments: dict[str, str] | None) -> types.GetPromptResult:
-        logger.debug(f"get_prompt 요청 처리, 이름: {name}, 인자: {arguments}")
         if name != "cad-assistant":
-            logger.error(f"알 수 없는 프롬프트: {name}")
             raise ValueError(f"알 수 없는 프롬프트: {name}")
-
-        prompt = PROMPT_TEMPLATE
-        logger.debug("프롬프트 템플릿 생성")
-
-        return types.GetPromptResult(
-            description="CAD 어시스턴트 프롬프트 템플릿",
-            messages=[
-                types.PromptMessage(
-                    role="user",
-                    content=types.TextContent(type="text", text=prompt.strip()),
-                )
-            ],
-        )
+        text = ("CAD MCP 도구로 캐디안을 제어합니다. 여러 도형은 draw_entities로 한 번에, 여러 편집은 "
+                "edit_entities로 한 번에 처리하고, 결과 확인은 preview_drawing을 우선 쓰세요.")
+        return types.GetPromptResult(description="CAD 도우미 프롬프트",
+                                     messages=[types.PromptMessage(
+                                         role="user", content=types.TextContent(type="text", text=text))])
 
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        logger.info("서버가 stdio 전송을 사용하여 실행 중")
+        logger.info("서버가 stdio 전송으로 실행 중")
         await server.run(
-            read_stream,
-            write_stream,
+            read_stream, write_stream,
             InitializationOptions(
-                server_name=config.server_name,
-                server_version=config.server_version,
+                server_name=CONFIG['server']['name'],
+                server_version=CONFIG['server']['version'],
                 capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
-        )
+                    notification_options=NotificationOptions(), experimental_capabilities={})))
+
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    asyncio.run(main())

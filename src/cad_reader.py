@@ -147,8 +147,50 @@ def hatch_loops(entity, lib=None) -> Tuple[List[List[Tuple[float, float, float]]
     return loops, kinds
 
 
-def read_entity(entity, lib=None) -> Dict[str, Any]:
-    """엔티티 하나를 dict로"""
+TEXT_JUSTIFY_NAMES = {
+    0: "left", 1: "center", 2: "right", 3: "aligned", 4: "middle", 5: "fit",
+    6: "top_left", 7: "top_center", 8: "top_right",
+    9: "middle_left", 10: "middle_center", 11: "middle_right",
+    12: "bottom_left", 13: "bottom_center", 14: "bottom_right",
+}
+MTEXT_ATTACH_NAMES = {
+    1: "top_left", 2: "top_center", 3: "top_right",
+    4: "middle_left", 5: "middle_center", 6: "middle_right",
+    7: "bottom_left", 8: "bottom_center", 9: "bottom_right",
+}
+
+
+def com_bbox(entity, lib) -> Optional[Tuple[float, float, float, float]]:
+    """GetBoundingBox로 실제 외곽. 캐디안은 in/out 점 객체 두 개를 넘겨야 한다"""
+    if lib is None:
+        return None
+    try:
+        mn, mx = entity.GetBoundingBox(lib.CreatePoint(0, 0, 0), lib.CreatePoint(0, 0, 0))
+        return (float(mn.x), float(mn.y), float(mx.x), float(mx.y))
+    except Exception:
+        return None
+
+
+def round_floats(value, ndigits: int = 1):
+    """출력용 반올림 (dict/list 재귀). 좌표 34847.62719249372 같은 긴 숫자로
+    토큰을 낭비하지 않게 한다 (개선 요청 4)"""
+    if isinstance(value, float):
+        r = round(value, ndigits)
+        return int(r) if ndigits <= 0 or r == int(r) else r
+    if isinstance(value, dict):
+        return {k: round_floats(v, ndigits) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [round_floats(v, ndigits) for v in value]
+    return value
+
+
+def read_entity(entity, lib=None, with_bbox: bool = True) -> Dict[str, Any]:
+    """엔티티 하나를 dict로
+
+    텍스트는 삽입점만으로는 실제 위치를 알 수 없다(정렬/부착점에 따라 글자가
+    삽입점 왼쪽·가운데·오른쪽에 놓인다). 그래서 Text/MText에는 정렬 이름과
+    GetBoundingBox로 구한 실제 외곽(bbox)을 함께 넣는다.
+    """
     info: Dict[str, Any] = {}
 
     for prop in ('ObjectName', 'EntityName', 'Handle', 'Layer'):
@@ -301,6 +343,30 @@ def read_entity(entity, lib=None) -> Dict[str, Any]:
                 info[key] = float(getattr(entity, prop))
             except Exception:
                 pass
+        if 'rotation' in info:
+            info['rotation'] = math.degrees(info['rotation'])
+        if kind == 'AcDbText':
+            try:
+                code = int(entity.Alignment)
+                info['justify'] = TEXT_JUSTIFY_NAMES.get(code, code)
+                if code != 0:
+                    grab_point('TextAlignmentPoint', 'align_point')
+            except Exception:
+                pass
+        else:
+            try:
+                info['attachment'] = MTEXT_ATTACH_NAMES.get(int(entity.AttachmentPoint),
+                                                            entity.AttachmentPoint)
+            except Exception:
+                pass
+            try:
+                info['width'] = float(entity.Width)
+            except Exception:
+                pass
+        if with_bbox:
+            bb = com_bbox(entity, lib)
+            if bb:
+                info['bbox'] = bb
 
     elif kind in ('AcDb2dPolyline', 'AcDbPolyline', 'AcDb3dPolyline'):
         info['points'] = points_list(getattr(entity, 'Coordinates', None), lib)
@@ -385,6 +451,7 @@ def expand_blocks(entities: List[Dict[str, Any]], doc,
         for sub in definition['entities']:
             clone = dict(sub)
             clone['from_block'] = name
+            clone.pop('bbox', None)   # 블록 정의 좌표계 기준이라 그대로 쓸 수 없다
             # 블록 정의의 색상이 BYLAYER면 인스턴스 색을 물려준다
             if clone.get('color', 256) in (0, 256):
                 clone['color'] = e.get('color', 256)
@@ -515,31 +582,50 @@ def _korean_font(size: int):
     return font
 
 
-def bounds_of(entities: List[Dict[str, Any]]) -> Tuple[float, float, float, float]:
-    xs, ys = [], []
-
+def _collect_xy(e: Dict[str, Any], xs: List[float], ys: List[float]) -> None:
     def add(xyz):
         if xyz:
             xs.append(xyz[0])
             ys.append(xyz[1])
 
-    for e in entities:
-        add(e.get('start'))
-        add(e.get('end'))
+    bbox = e.get('bbox')
+    if bbox:
+        xs.extend([bbox[0], bbox[2]])
+        ys.extend([bbox[1], bbox[3]])
+    else:
         add(e.get('position'))
-        add(e.get('ext1'))
-        add(e.get('ext2'))
-        add(e.get('text_position'))
-        for p in e.get('points', []) or []:
+    add(e.get('start'))
+    add(e.get('end'))
+    add(e.get('ext1'))
+    add(e.get('ext2'))
+    add(e.get('text_position'))
+    for p in e.get('points', []) or []:
+        add(p)
+    for loop in e.get('loops', []) or []:
+        for p in loop:
             add(p)
-        for loop in e.get('loops', []) or []:
-            for p in loop:
-                add(p)
-        center = e.get('center')
-        if center:
-            r = e.get('radius') or e.get('major') or 0
-            xs.extend([center[0] - r, center[0] + r])
-            ys.extend([center[1] - r, center[1] + r])
+    center = e.get('center')
+    if center:
+        r = e.get('radius') or e.get('major') or 0
+        xs.extend([center[0] - r, center[0] + r])
+        ys.extend([center[1] - r, center[1] + r])
+
+
+def entity_bbox(info: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    """read_entity() 결과 하나의 2D 외곽 (텍스트는 bbox가 있으면 그것을 쓴다)"""
+    xs: List[float] = []
+    ys: List[float] = []
+    _collect_xy(info, xs, ys)
+    if not xs or not ys:
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def bounds_of(entities: List[Dict[str, Any]]) -> Tuple[float, float, float, float]:
+    xs: List[float] = []
+    ys: List[float] = []
+    for e in entities:
+        _collect_xy(e, xs, ys)
 
     if not xs or not ys:
         return (0.0, 0.0, 100.0, 100.0)
@@ -665,11 +751,32 @@ def render_png(entities: List[Dict[str, Any]], width: int = 1200,
                 label += " [" + ", ".join(f"{k}={v}" for k, v in attrs.items()) + "]"
             draw.text((px + 8, py - 6), label, fill=rgb, font=font)
 
-        elif kind in ('AcDbText', 'AcDbMText') and e.get('position'):
-            px, py = to_px(*e['position'][:2])
+        elif kind in ('AcDbText', 'AcDbMText') and (e.get('bbox') or e.get('position')):
             size = max(int((e.get('height') or 2.5) * scale), 8)
-            draw.text((px, py - size), str(e.get('text', '')),
-                      fill=rgb, font=_korean_font(size))
+            fnt = _korean_font(size)
+            text = str(e.get('text', '')).replace('\\P', '\n')
+            bbox = e.get('bbox')
+            if bbox:
+                # 정렬/부착점에 따라 글자는 삽입점 왼쪽에도, 가운데에도 놓인다.
+                # 예전에는 늘 삽입점에서 왼쪽 정렬로 그려서, 미러 후 부착점이
+                # 오른쪽으로 바뀐 MText가 글자 폭만큼 밀려 보였다.
+                bx0, by1 = to_px(bbox[0], bbox[3])
+                bx1, _ = to_px(bbox[2], bbox[1])
+                try:
+                    tw = draw.multiline_textbbox((0, 0), text, font=fnt)[2]
+                except Exception:
+                    tw = 0
+                attach = str(e.get('attachment') or '')
+                if attach.endswith('right'):
+                    x = bx1 - tw
+                elif attach.endswith('center'):
+                    x = (bx0 + bx1 - tw) / 2
+                else:
+                    x = bx0
+                draw.multiline_text((x, by1), text, fill=rgb, font=fnt)
+            else:
+                px, py = to_px(*e['position'][:2])
+                draw.multiline_text((px, py - size), text, fill=rgb, font=fnt)
 
         elif e.get('points'):
             pts = [to_px(p[0], p[1]) for p in e['points']]

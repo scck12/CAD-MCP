@@ -286,3 +286,79 @@ edge case 재현 실패), 사용자가 단서로 제시한 stale-proxy 가설도
 다만 조사 과정에서 `cad_reconnect`의 "not_connected 오보고" 버그를 찾아
 수정함 — 원래 제보(서버가 죽었다/타임아웃)에 대한 직접 증거는 아니지만,
 향후 재연결 후 상태 판단에 혼란을 줄 수 있었던 실제 결함.
+
+## 2026-10-12 — 도면 작업 세션 개선 요청서(19개 항목) 반영
+
+분양 평면도 3종 작도 세션이 정리한 `cad-mcp-개선요청.md`를 받아 처리. 서버를
+대부분 다시 짰다(`server.py` 도구 레지스트리, `cad_worker.py`, `cad_controller.py`
+전면 재작성, `colors.py` 신설, `nlp_processor.py`/`verify_cadian.py` 삭제).
+
+**먼저 COM API를 확인했다** (추측으로 짜면 또 깨지므로): makepy 래퍼에서 시그니처를
+읽고, 격리 캐디안 인스턴스(`DispatchEx`)에서 probe로 실제 동작을 확인. 사용자의
+작업 도면(PID 571048)은 건드리지 않음. 확인된 것 → spec.md "알려진 함정"에 반영.
+
+**요청별 진단/처리**
+
+- 2-1A 유령 핸들 582: 로그 확인 결과 **2026-09-04 11:18:57 `핸들 582 삭제`**
+  (edit_entity delete 성공)가 있고, 21:23의 두 번 실패는 이미 지운 핸들을 다시
+  지우려던 것. 생성 결과가 틀어진 게 아니라 앞서 그 세션이 벽을 지운 것이었다.
+  그래도 생성 경로를 `_create()` 하나로 모아 "생성→스타일→핸들 확인, 실패 시 만든
+  것 삭제"로 고정했고, 이제 도구 시작/종료와 인자가 로그에 남아 같은 의문을 바로
+  추적할 수 있다.
+- 2-1B 에러인데 생성됨(4F8·506·514): 2026-09-04의 RPC_E_WRONG_THREAD 수정 이전
+  현상. 추가로, 시간 초과 후 큐에 남아 있던 작업이 나중에 실행될 수 있던 경로를
+  막았다(시작 전 포기한 작업은 취소 표시). 실행 중이던 작업이 늦게 끝나면 "늦게
+  완료됨" 알림을 다음 응답에 붙인다.
+- 2-2 무한 대기/서버 사망: 재현은 여전히 안 됐다(이전 조사 참고). 대신 구조적
+  원인이 될 수 있는 것을 전부 고쳤다. ① 핸들러가 이벤트 루프 위에서 COM을 동기로
+  기다려, 한 호출이 막히면 서버 전체가 응답 불가였다 → `asyncio.to_thread`.
+  ② 타임아웃이 큐 대기까지 포함해 느린 작업 뒤의 정상 작업이 막힘을 유발할 수
+  있었다 → 시작 시점 기준. ③ 스레드 종료 시 COM 참조를 쥔 채 `CoUninitialize`를
+  불러, 재연결 후 옛 프록시 Release가 내려간 아파트먼트에서 불릴 수 있었다 → 참조
+  먼저 해제(사용자 가설 "재연결이 이전 프록시를 정리하지 않는다"와 가장 가까운 실제
+  결함). ④ 미리보기 렌더링 등 작업 스레드 밖 처리에 상한이 없었다 →
+  `HARD_TIMEOUT` 280초. ⑤ 다음 장애 때 원인을 잡도록 faulthandler 크래시 덤프
+  (`cad_mcp_crash.log`)와 도구 시작/종료 로그 추가. 기본 타임아웃 45→30초.
+- 2-3 활성 문서 캐싱: 모든 작업 직전 `ActiveDocument`를 다시 읽어 바뀌면 대상
+  교체 + 알림. `document` 도구(list/new/open/activate/save) 추가.
+- 2-4 색 기본값: 원인 둘 — draw_entities는 색을 안 주면 CECOLOR를 따라갔고, 단일
+  도구는 색 파서가 None을 7로 바꿨다. 이제 지정 안 하면 BYLAYER를 명시. 또
+  `create_layer`가 도형마다 ActiveLayer를 바꾸던 부작용(MCP_TEST_TMP가 현재 레이어로
+  남은 원인) 제거. E2E에서 CECOLOR=1, CLAYER=TEST_CURRENT로 오염시킨 뒤 기본값이
+  BYLAYER/"0"이고 현재 레이어가 유지되는지 확인.
+- 3-1/3-2/3-3: `set_properties` 연산, `edit_entities`(handles 또는 selector{window,
+  mode, layers, types}) 추가.
+- 3-4 텍스트: `draw_text.justify`, `draw_mtext`, `edit_text` 추가. **"MText 미러 시
+  라벨이 글자 폭만큼 밀린다"는 CAD 문제가 아니었다** — probe로 캐디안 Mirror가 MText
+  부착점(1→3, 4→6)과 Text 위치를 정확히 뒤집는 것을 확인(제자리·복사, 폭 0/2000).
+  원인은 `list_entities`가 부착점을 안 알려주고 `preview_drawing`이 MText를 항상
+  삽입점에서 왼쪽 정렬로 그린 것. 미러 후 삽입점이 오른쪽 끝으로 가니 미리보기에서
+  글자가 오른쪽으로 밀려 보였다. 이제 Text/MText에 justify/attachment/width/bbox를
+  보고하고, 미리보기는 bbox 기준으로 그린다.
+- 3-5 bbox: `GetBoundingBox`는 in/out 점 객체 두 개를 넘겨야 동작한다(2026-09-04
+  probe가 인자 없이 불러서 "불안정"으로 오판). `get_bbox` 도구, 선택 판정도 이걸로.
+- 3-6: `manage_layers`, `set_current`, `purge`. 사용 중 레이어는 CADian이
+  `E_FAIL`로 삭제를 거부하는 것도 확인.
+- 3-7 process_command: 원본 중국어 키워드 파서라 실제 요청에 None만 반환 → 도구와
+  `nlp_processor.py` 삭제, `send_command`(끝나지 않는 명령은 ESC로 취소) 추가.
+- 3-8: `zoom_extents` 도구.
+- 4 효율: `add_dimension_chain`, draw_entities에 dimension/wall/door/window 타입,
+  기본 응답에 핸들 목록, `atomic` 롤백, list_entities precision/window/fields,
+  `undo`(도구 호출 단위 실행 취소 마크).
+- 5: `insert_opening`(벽 2조각 + 문/창 기호), `break_entity`(닫힌 폴리라인 짧은
+  쪽 제거), draw_entities의 wall/door/window.
+- 6-2 에러 메시지: `오류[종류]: ...` + HRESULT 이름, `isError=true`.
+- 6-3 cad_status 불일치: COM 없이 상태 보고, state/note로 지연 연결을 명시.
+- 6-4 draw_arc 규약을 도구 설명에 명시(반시계, 270→0은 90° 호).
+- 그 외 발견: 연결 실패 시 열린 문서를 저장 없이 모두 닫던 코드 제거.
+
+**성능 실측**: 도형 하나 100~160ms(AddLine ~64ms, Layer 지정 ~20ms) — CADian COM
+내부 비용. draw_entities 시간 제한을 30+0.5×개수초로.
+
+**검증**: `tests/e2e_isolated.py` 신설 — 작업 스레드 단위 8개 + 격리 캐디안에서
+실제 서버 E2E 56개, **64/64 통과**(2회 실행). 사용자 캐디안에는 새 서버를 읽기
+전용으로만 붙여 확인(cad_status, list_entities, manage_layers list, document list —
+step2.dwg, 129개 엔티티, Text bbox/justify 정상).
+
+**남은 것**: 사용자 MCP 클라이언트가 새 도구를 보려면 MCP 재연결/앱 재시작이
+필요하다. 장애 재발 시 `cad_mcp_crash.log`와 로그의 마지막 "도구 시작"을 먼저 본다.

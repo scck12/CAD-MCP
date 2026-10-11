@@ -5,8 +5,9 @@ __pycache__/
 # Virtual environment
 .venv/
 
-# Logs
+# Logs (회전된 cad_mcp.log.1 등 포함)
 *.log
+*.log.*
 
 # Backup files
 *.bak

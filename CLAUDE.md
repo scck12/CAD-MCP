@@ -42,11 +42,20 @@ CADian(IntelliCAD 계열)을 COM 자동화로 제어하는 MCP 서버. 이 프�
   작도되는데도 `RPC_E_WRONG_THREAD`로 실패하는, 진단하기 까다로운 버그가
   난다.
 - **CAD 쪽 변경은 `py_compile`만으로 검증됐다고 보지 않는다.** COM 호출의
-  실제 동작은 런타임에만 드러난다. 캐디안이 떠 있으면 실제 `mcp__CAD__*`
-  도구를 호출하거나(가능하면), `CADController`를 별도 프로세스에서 직접
-  import해 검증한다(같은 캐디안 인스턴스에 별도 COM 연결하는 것은
-  안전함 — 표준 프로세스 간 COM). 테스트로 만든 엔티티는 전용 임시
-  레이어를 쓰고 반드시 정리한다.
+  실제 동작은 런타임에만 드러난다. 기본 검증은
+  `.venv\Scripts\python.exe tests\e2e_isolated.py` — 새 캐디안 인스턴스와 새
+  도면을 띄워(`CAD_MCP_ISOLATED=1`) 실제 MCP 서버를 클라이언트로 호출한다. 새
+  도구/동작을 넣으면 이 파일에 항목을 추가하고 전부 통과시킨다.
+- **사용자의 캐디안·작업 도면에는 쓰기 테스트를 하지 않는다.** 사용자 쪽은 읽기
+  전용 도구(`cad_status`, `list_entities`, `manage_layers list`, `document list`)
+  로만 확인한다. 예전에 작업 도면에 `MCP_TEST_TMP` 엔티티를 남겼고, 사용자가 하필
+  그 레이어에 가구를 그려 두어 레이어 단위 삭제 시 실데이터가 같이 지워질 뻔했다.
+  COM 동작을 탐색할 때도 `win32com.client.DispatchEx`로 새 인스턴스를 띄워서 하고
+  끝나면 그 프로세스만 닫는다.
+- **COM API를 새로 쓰기 전에 makepy 래퍼에서 시그니처를 확인한다**
+  (`.venv\Lib\site-packages\win32com\gen_py\77E49E57-...\IIcad*.py`). in/out 인자,
+  점 객체(VT_DISPATCH) 여부가 다 나온다. `GetBoundingBox`를 "불안정하다"고 잘못
+  결론 낸 적이 있다 — 실제로는 in/out 점 객체 두 개를 넘겨야 했을 뿐이었다.
 - **새 MCP 도구를 추가한 뒤 이 앱의 도구 목록에 안 잡히면**, 서버
   프로세스 재시작만으로는 부족할 수 있다(MCP 클라이언트가 연결 시점에
   도구 목록을 캐시하는 것으로 보임). 이 경우 사용자에게 MCP 서버
