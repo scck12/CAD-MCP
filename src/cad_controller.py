@@ -143,6 +143,8 @@ class CADController:
         self.app = None
         self.doc = None
         self._lib = None
+        self._bb_pts = None
+        self._clayer: Optional[str] = None   # 작업 하나 동안 쓰는 CLAYER 캐시
         self.doc_name: Optional[str] = None
         self._doc_key: Optional[str] = None
         self._known_layers: set = set()
@@ -312,6 +314,8 @@ class CADController:
 
     def release(self) -> None:
         """COM 참조를 모두 놓는다 (작업 스레드 종료 직전에 호출)"""
+        self._bb_pts = None
+        self._clayer = None
         self._lib = None
         self.doc = None
         self.app = None
@@ -332,6 +336,7 @@ class CADController:
         self.doc_name = name
         self._doc_key = f"{full}|{name}"
         self._known_layers = set()
+        self._clayer = None
 
     def connect(self) -> None:
         """캐디안에 연결. 실패하면 CADError
@@ -409,6 +414,7 @@ class CADController:
 
     def prepare(self) -> Optional[str]:
         """작업 직전 호출: 연결 보장 + 활성 문서 동기화"""
+        self._clayer = None     # 사용자가 작업 사이에 현재 레이어를 바꿨을 수 있다
         if not self.is_running():
             self.connect()
             return None
@@ -514,6 +520,14 @@ class CADController:
                     return layer
         return None
 
+    def _current_layer(self) -> Optional[str]:
+        if self._clayer is None:
+            try:
+                self._clayer = str(self.doc.GetVariable("CLAYER"))
+            except Exception:
+                return None
+        return self._clayer
+
     def _ensure_layer(self, name: str) -> None:
         """레이어가 없으면 만든다. 현재 레이어(CLAYER)는 바꾸지 않는다
 
@@ -539,8 +553,11 @@ class CADController:
         if layer is None and defaults:
             layer = self.default_layer
         if layer:
-            self._ensure_layer(str(layer))
-            entity.Layer = str(layer)
+            layer = str(layer)
+            self._ensure_layer(layer)
+            # 새 엔티티는 현재 레이어에 생기므로 같으면 쓰지 않는다 (Layer 쓰기 ~20ms)
+            if not (defaults and layer == self._current_layer()):
+                entity.Layer = layer
 
         code = parse_color(color)
         if code is None and defaults:
@@ -589,8 +606,9 @@ class CADController:
         """
         try:
             if self._is_dispatch_point_cad():
-                mn, mx = entity.GetBoundingBox(self.lib.CreatePoint(0, 0, 0),
-                                               self.lib.CreatePoint(0, 0, 0))
+                if self._bb_pts is None:     # in/out 점 한 쌍을 재사용 (엔티티마다 만들지 않음)
+                    self._bb_pts = cad_reader.bbox_points(self.lib)
+                mn, mx = entity.GetBoundingBox(*self._bb_pts)
                 return (mn.x, mn.y, mx.x, mx.y)
             mn, mx = entity.GetBoundingBox()
             return (mn[0], mn[1], mx[0], mx[1])
@@ -759,14 +777,19 @@ class CADController:
         text_obj.Alignment = code
         text_obj.TextAlignmentPoint = self._pt(position)
 
-    @staticmethod
-    def _attach_code(attachment: Optional[str]) -> Optional[int]:
+    # Text용 정렬 이름을 MText 부착점으로 (edit_text에서 justify를 MText에 줄 때)
+    _JUSTIFY_TO_ATTACH = {"left": "top_left", "center": "top_center",
+                          "right": "top_right", "middle": "middle_center"}
+
+    @classmethod
+    def _attach_code(cls, attachment: Optional[str]) -> Optional[int]:
         if attachment is None:
             return None
         if isinstance(attachment, int):
             return attachment
         key = str(attachment).lower().replace("-", "_").replace(" ", "_")
         key = _JUSTIFY_ALIASES.get(key, key)
+        key = cls._JUSTIFY_TO_ATTACH.get(key, key)
         if key not in MTEXT_ATTACH:
             raise CADError(f"attachment '{attachment}'는 지원하지 않습니다: {sorted(MTEXT_ATTACH)}")
         return MTEXT_ATTACH[key]
@@ -1332,7 +1355,10 @@ class CADController:
                 anchor = position
                 if anchor is None:
                     # 위치를 안 주면 지금 보이는 자리 기준으로 새 정렬점을 정한다
-                    x0, y0, x1, y1 = self._bbox(entity)
+                    bb = self._bbox(entity)
+                    if bb is None:
+                        raise CADError("텍스트 외곽을 읽을 수 없어 정렬점을 정할 수 없습니다. position을 주세요")
+                    x0, y0, x1, y1 = bb
                     key = _JUSTIFY_ALIASES.get(str(justify).lower(), str(justify).lower())
                     ax = x0 if "left" in key or key == "left" else \
                         x1 if "right" in key else (x0 + x1) / 2
@@ -1414,6 +1440,14 @@ class CADController:
         ss = [(p[0] - a[0]) * ux + (p[1] - a[1]) * uy for p in pts]
         tt = [(p[0] - a[0]) * nx + (p[1] - a[1]) * ny for p in pts]
         s_min, s_max, t_min, t_max = min(ss), max(ss), min(tt), max(tt)
+        # 직사각형이 아니면(사다리꼴·비스듬한 끝) 두 조각을 사각형으로 다시 그리면
+        # 원래 모양이 바뀐다. 꼭짓점마다 외곽 사각형의 모서리에 있는지 확인한다.
+        tol = max(0.5, 1e-6 * max(s_max - s_min, t_max - t_min))
+        for s, t in zip(ss, tt):
+            if min(abs(s - s_min), abs(s - s_max)) > tol or \
+                    min(abs(t - t_min), abs(t - t_max)) > tol:
+                raise CADError("벽이 직사각형이 아닙니다(꼭짓점이 외곽 사각형 모서리에 없음). "
+                               "모양을 바꾸지 않도록 거부합니다 — break_entity로 끊으세요")
         cx, cy, _ = self._normalize(center)
         sc = (cx - a[0]) * ux + (cy - a[1]) * uy
         w = float(width)
@@ -1500,6 +1534,8 @@ class CADController:
             sp, ep = (s.x, s.y), (e.x, e.y)
             dx, dy = ep[0] - sp[0], ep[1] - sp[1]
             length2 = dx * dx + dy * dy
+            if length2 < 1e-12:
+                raise CADError(f"핸들 {handle}은(는) 길이 0인 선이라 끊을 수 없습니다")
             ts = sorted(max(0.0, min(1.0, ((q[0] - sp[0]) * dx + (q[1] - sp[1]) * dy) / length2))
                         for q in (q1, q2))
             pieces = []
@@ -1629,15 +1665,20 @@ class CADController:
     # 레이어 / 현재값 / 정리
     # ==================================================================
 
-    def _layer_usage(self) -> Tuple[Dict[str, int], set]:
-        """레이어별 엔티티 수(모델+페이퍼+블록 정의 전체)와 참조된 블록 이름"""
+    def _layer_usage(self) -> Tuple[Dict[str, int], set, Dict[str, int]]:
+        """한 번의 순회로 (레이어별 사용 수[모델+페이퍼+블록 정의 전체],
+        참조된 블록 이름, 레이어별 모델 공간 엔티티 수)"""
         counts: Dict[str, int] = {}
+        model: Dict[str, int] = {}
         referenced = set()
 
-        def tally(container):
+        def tally(container, is_model):
             for entity in container:
                 try:
-                    counts[entity.Layer] = counts.get(entity.Layer, 0) + 1
+                    layer = entity.Layer
+                    counts[layer] = counts.get(layer, 0) + 1
+                    if is_model:
+                        model[layer] = model.get(layer, 0) + 1
                     if self._type_key(entity.ObjectName) == "blockreference":
                         referenced.add(entity.Name)
                 except Exception:
@@ -1646,25 +1687,19 @@ class CADController:
         saw_model = False
         for block in self.doc.Blocks:
             try:
-                if block.Name.lower() == "*model_space":
-                    saw_model = True
+                is_model = block.Name.lower() == "*model_space"
             except Exception:
-                pass
-            tally(block)
+                is_model = False
+            saw_model = saw_model or is_model
+            tally(block, is_model)
         if not saw_model:   # 블록 컬렉션에 모델 공간이 안 잡히는 구현 대비
-            tally(self.doc.ModelSpace)
-        return counts, referenced
+            tally(self.doc.ModelSpace, True)
+        return counts, referenced, model
 
     def list_layers(self) -> List[Dict[str, Any]]:
         # entities는 모델 공간 개수. 치수·블록 내부까지 센 사용 여부(in_use)는
         # 따로 둔다 — 합쳐서 보이면 치수 20개짜리 레이어가 400개로 보인다.
-        usage, _ = self._layer_usage()
-        model: Dict[str, int] = {}
-        for entity in self.doc.ModelSpace:
-            try:
-                model[entity.Layer] = model.get(entity.Layer, 0) + 1
-            except Exception:
-                continue
+        usage, _, model = self._layer_usage()
         current = self.doc.GetVariable("CLAYER")
         out = []
         for layer in self.doc.Layers:
@@ -1698,7 +1733,7 @@ class CADController:
                 raise CADError(f"'{name}' 레이어는 지울 수 없습니다")
             if self.doc.GetVariable("CLAYER") == name:
                 raise CADError("현재 레이어는 지울 수 없습니다. set_current로 바꾼 뒤 지우세요")
-            counts, _ = self._layer_usage()
+            counts, _, _ = self._layer_usage()
             if counts.get(name):
                 raise CADError(f"'{name}' 레이어에 엔티티 {counts[name]}개가 있어 지울 수 없습니다. "
                                "delete_by_layer로 비우거나 edit_entities set_properties로 옮기세요")
@@ -1712,6 +1747,7 @@ class CADController:
                 raise CADError("'0' 레이어는 이름을 바꿀 수 없습니다")
             layer.Name = str(new_name)
             self._known_layers.discard(name)
+            self._clayer = None
             return {"renamed": [name, new_name]}
         if action == "set":
             code = parse_color(color)
@@ -1738,6 +1774,7 @@ class CADController:
         if layer is not None:
             self._ensure_layer(layer)
             self.doc.ActiveLayer = self._layer_obj(layer)
+            self._clayer = None
         if color is not None:
             self.doc.SetVariable("CECOLOR", color_sysvar(color))
         return {"clayer": self.doc.GetVariable("CLAYER"),
@@ -1760,7 +1797,7 @@ class CADController:
             self.doc.PurgeAll()
             self.doc.PurgeAll()   # 블록 안의 블록까지 한 번 더
         elif kind in ("layers", "blocks"):
-            counts, referenced = self._layer_usage()
+            counts, referenced, _ = self._layer_usage()
             if kind == "layers":
                 current = self.doc.GetVariable("CLAYER")
                 for layer in list(self.doc.Layers):

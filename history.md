@@ -362,3 +362,25 @@ step2.dwg, 129개 엔티티, Text bbox/justify 정상).
 
 **남은 것**: 사용자 MCP 클라이언트가 새 도구를 보려면 MCP 재연결/앱 재시작이
 필요하다. 장애 재발 시 `cad_mcp_crash.log`와 로그의 마지막 "도구 시작"을 먼저 본다.
+
+## 2026-10-12 — 위 작업 코드 리뷰 지적 10건 수정
+
+- `cad_status` 확인 요청이 다른 작업 뒤에 최대 120초 줄 서고, 10초 넘으면 스레드를
+  막힘으로 만들던 문제 → `worker.run(queue_wait=0.5, mark_stuck=False)`. 상태
+  확인이 그 자체로 서버를 막지 않는다.
+- `round_floats`가 inf/NaN에서 `int()` 예외 → None으로 (빈 도면 EXTMIN 등).
+- `edit_text`에서 MText에 justify(center 등)를 주면 거부 → top_center 등 부착점으로
+  매핑.
+- `list_entities`가 limit과 무관하게 도면 전체(최대 1500개)를 상세히 읽던 것 →
+  limit개만 읽고 전체 개수는 `ModelSpace.Count`/선택 결과 수.
+- `GetBoundingBox`용 점 객체를 엔티티마다 2개씩 만들던 것 → 스캔당 한 쌍 재사용.
+- 새 엔티티가 이미 현재 레이어에 생기는데도 Layer를 매번 쓰던 것(~20ms) → 같으면
+  생략(CLAYER는 작업마다 한 번 읽어 캐시). 250개 배치 39.2초 → 26.7초.
+- `manage_layers list`가 모델 공간을 두 번 순회 → 한 번에.
+- `break_entity` 길이 0 선에서 ZeroDivisionError → CADError.
+- 내부 KeyError가 "필수 인자 누락"으로 보이던 것 → `MISSING_VALUE`, save_drawing은
+  config output이 없어도 기본 폴더 사용.
+- `insert_opening`이 사다리꼴 벽을 말없이 직사각형으로 바꾸던 것 → 직사각형이
+  아니면 거부.
+
+검증: `tests/e2e_isolated.py`에 각 항목 회귀 테스트 추가, **73/73 통과**.

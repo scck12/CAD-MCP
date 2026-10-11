@@ -160,12 +160,23 @@ MTEXT_ATTACH_NAMES = {
 }
 
 
-def com_bbox(entity, lib) -> Optional[Tuple[float, float, float, float]]:
-    """GetBoundingBox로 실제 외곽. 캐디안은 in/out 점 객체 두 개를 넘겨야 한다"""
+def bbox_points(lib):
+    """GetBoundingBox에 넘길 in/out 점 객체 한 쌍. 스캔 한 번에 한 쌍만 만들어
+    재사용한다 (엔티티마다 만들면 COM 호출이 2번씩 늘어난다).
+    같은 작업 스레드 안에서만 쓸 것 — COM 객체라 스레드를 넘길 수 없다."""
     if lib is None:
         return None
+    return (lib.CreatePoint(0, 0, 0), lib.CreatePoint(0, 0, 0))
+
+
+def com_bbox(entity, lib, pts=None) -> Optional[Tuple[float, float, float, float]]:
+    """GetBoundingBox로 실제 외곽. 캐디안은 in/out 점 객체 두 개를 넘겨야 한다"""
+    if pts is None:
+        pts = bbox_points(lib)
+    if pts is None:
+        return None
     try:
-        mn, mx = entity.GetBoundingBox(lib.CreatePoint(0, 0, 0), lib.CreatePoint(0, 0, 0))
+        mn, mx = entity.GetBoundingBox(pts[0], pts[1])
         return (float(mn.x), float(mn.y), float(mx.x), float(mx.y))
     except Exception:
         return None
@@ -175,6 +186,8 @@ def round_floats(value, ndigits: int = 1):
     """출력용 반올림 (dict/list 재귀). 좌표 34847.62719249372 같은 긴 숫자로
     토큰을 낭비하지 않게 한다 (개선 요청 4)"""
     if isinstance(value, float):
+        if not math.isfinite(value):
+            return None    # 빈 도면의 EXTMIN 등. int()가 터지고 JSON도 표현 못 한다
         r = round(value, ndigits)
         return int(r) if ndigits <= 0 or r == int(r) else r
     if isinstance(value, dict):
@@ -184,7 +197,7 @@ def round_floats(value, ndigits: int = 1):
     return value
 
 
-def read_entity(entity, lib=None, with_bbox: bool = True) -> Dict[str, Any]:
+def read_entity(entity, lib=None, with_bbox: bool = True, bbox_pts=None) -> Dict[str, Any]:
     """엔티티 하나를 dict로
 
     텍스트는 삽입점만으로는 실제 위치를 알 수 없다(정렬/부착점에 따라 글자가
@@ -364,7 +377,7 @@ def read_entity(entity, lib=None, with_bbox: bool = True) -> Dict[str, Any]:
             except Exception:
                 pass
         if with_bbox:
-            bb = com_bbox(entity, lib)
+            bb = com_bbox(entity, lib, bbox_pts)
             if bb:
                 info['bbox'] = bb
 
@@ -405,7 +418,7 @@ def read_block_definition(doc, name: str, lib=None,
                     members.append(block.Item(i))
             except Exception:
                 pass
-        result['entities'] = [read_entity(m, lib) for m in members]
+        result['entities'] = [read_entity(m, lib, with_bbox=False) for m in members]
     except Exception as e:
         logger.debug(f"블록 '{name}' 정의 읽기 실패: {e}")
 
@@ -502,15 +515,19 @@ def compact_entity(e: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def read_entities(doc, lib=None, limit: int = 1500) -> List[Dict[str, Any]]:
-    """모델 공간의 모든 엔티티를 읽는다"""
+def read_entities(doc, lib=None, limit: int = 1500,
+                  entities=None) -> List[Dict[str, Any]]:
+    """모델 공간(또는 주어진 엔티티 목록)을 앞에서부터 limit개까지 읽는다
+
+    limit에서 멈춘다 — 목록 일부만 필요할 때 전부 읽지 않도록.
+    """
     result = []
+    pts = bbox_points(lib)
     try:
-        for entity in doc.ModelSpace:
-            result.append(read_entity(entity, lib))
+        for entity in (doc.ModelSpace if entities is None else entities):
             if len(result) >= limit:
-                logger.warning(f"엔티티 {limit}개에서 중단")
                 break
+            result.append(read_entity(entity, lib, bbox_pts=pts))
     except Exception as e:
         logger.error(f"엔티티 순회 실패: {e}")
     return result

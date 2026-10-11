@@ -158,6 +158,14 @@ async def run_tests():
             # --- 텍스트 수정 (요청 3-4)
             r = await c.ok("edit_text", {"handle": text_h, "height": 200, "text": "드레스룸"})
             check("edit_text 반영", "드레스룸" in r and "200" in r, r)
+            err, t, _ = await c.call("edit_text", {"handle": mtext_h, "justify": "center"})
+            check("MText에 justify=center → top_center 부착점", not err and "top_center" in t, t)
+
+            # --- 목록은 limit만큼만 읽고 전체 개수는 정확히
+            info_n = json.loads(await c.ok("get_drawing_info"))["entity_count"]
+            t = await c.ok("list_entities", {"limit": 2})
+            check("list_entities limit 2 + 전체 개수", f"엔티티 {info_n}개" in t and "앞 2개만" in t
+                  and len(entities_of(t)) == 2, t[:200])
 
             # --- 개구부 (요청 5)
             r = await c.ok("insert_opening", {"handle": wall_h, "center": [2000, 3000], "width": 900,
@@ -167,6 +175,19 @@ async def run_tests():
                   and len(m.group(2).split(",")) == 2, r)
             err, t, _ = await c.call("edit_entity", {"handle": wall_h, "operation": "delete"})
             check("원래 벽은 삭제됨", err and "CAD_ERROR" in t, t)
+
+            quad_h = (await c.ok("draw_polyline", {"points": [[0, 9000], [1000, 9000], [1100, 9200], [100, 9200]],
+                                                   "closed": True})).split(": ")[1]
+            err, t, _ = await c.call("insert_opening", {"handle": quad_h, "center": [500, 9100], "width": 200})
+            check("직사각형 아닌 벽은 insert_opening 거부", err and "직사각형이 아닙니다" in t, t)
+            err, t, _ = await c.call("draw_line", {"start_point": [5, 9500], "end_point": [5, 9500]})
+            if err:
+                check("길이 0 선(캐디안이 생성 자체를 거부)", "CAD_ERROR" in t or "COM_ERROR" in t, t)
+            else:
+                zero_h = t.split(": ")[1]
+                err, t, _ = await c.call("break_entity", {"handle": zero_h, "point1": [5, 9500],
+                                                          "point2": [5, 9500]})
+                check("길이 0 선 끊기는 CAD_ERROR", err and "CAD_ERROR" in t and "길이 0" in t, t)
 
             # --- 끊기 (요청 5)
             loop_h = (await c.ok("draw_rectangle", {"corner1": [0, 6000], "corner2": [3000, 7000]})).split(": ")[1]
@@ -188,6 +209,8 @@ async def run_tests():
             check("purge layers가 빈 레이어 제거", "빈레이어2" in r, r)
             layers = [json.loads(l) for l in (await c.ok("manage_layers", {"action": "list"})).splitlines()]
             check("purge가 사용 중 레이어는 남김", any(x["name"] == "가구" for x in layers), layers)
+            gagu = next((x for x in layers if x["name"] == "가구"), {})
+            check("레이어 목록: 모델 공간 개수 + in_use", gagu.get("entities", 0) >= 3 and gagu.get("in_use"), gagu)
             r = await c.ok("set_current", {"layer": "0", "color": "BYLAYER"})
             check("현재값 원복", "BYLAYER" in r, r)
 
@@ -236,6 +259,8 @@ async def run_tests():
             check("배치 진행 중 cad_status 즉시 응답", dt < 3.0 and st["state"] == "busy", (dt, st))
             err, text, _ = await batch
             check("긴 배치 완료", not err and "250개 중 250개 성공" in text, text[:200])
+            st = json.loads(await c.ok("cad_status"))
+            check("배치 중 상태 확인이 막힘을 남기지 않음", not st["stuck"], st)
 
             st = json.loads(await c.ok("cad_status"))
             check("종료 전 상태 ready", st["state"] == "ready", st)
@@ -274,8 +299,29 @@ def worker_unit_tests():
     out["b"] = w.run(lambda c: "b", timeout=1, connect=False)
     th.join()
     check("앞 작업 대기는 시간 제한에 포함 안 됨", out == {"a": "a", "b": "b"}, out)
+    # 상태 확인용 요청: 앞 작업 뒤에 오래 줄 서지 않고, 시간 초과해도 막힘을 남기지 않는다
+    th = threading.Thread(target=lambda: w.run(lambda c: time.sleep(2), timeout=5, connect=False))
+    th.start()
+    time.sleep(0.2)
+    t0 = time.monotonic()
+    try:
+        w.run(lambda c: 1, timeout=10, connect=False, queue_wait=0.5, mark_stuck=False)
+        check("probe는 큐에서 0.5초만 기다림", False)
+    except cad_worker.CADBusy:
+        check("probe는 큐에서 0.5초만 기다림", time.monotonic() - t0 < 1.5)
+    th.join()
+    try:
+        w.run(lambda c: time.sleep(1.5), timeout=0.5, connect=False, mark_stuck=False)
+    except cad_worker.CADBusy:
+        pass
+    check("mark_stuck=False 시간 초과는 막힘을 남기지 않음", not w.status()["stuck"], w.status())
+    time.sleep(1.2)
     w.restart()
     check("restart 후 새 스레드", w.status()["thread_alive"], w.status())
+
+    import cad_reader
+    r = cad_reader.round_floats({"a": float("inf"), "b": [float("nan"), 1.25, 3.0]}, 1)
+    check("round_floats가 inf/NaN을 None으로", r == {"a": None, "b": [None, 1.2, 3]}, r)
 
 
 def main():

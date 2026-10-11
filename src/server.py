@@ -128,9 +128,13 @@ class CADService:
         info = self.worker.status()
         # 연결돼 있고 한가할 때만 가볍게 확인한다 (활성 문서 동기화 포함).
         # 연결이 없을 때 확인하려 들면 캐디안을 띄워 버릴 수 있어 하지 않는다.
+        # 확인 요청은 다른 작업 뒤에 줄 서지 않고(0.5초 안에 시작 못 하면 생략),
+        # 응답이 늦어도 스레드를 막힘으로 표시하지 않는다 — 상태 확인이
+        # 그 자체로 서버를 막아서는 안 된다.
         if info.get("state") == "ready":
             try:
-                self.worker.run(lambda c: c.doc_name, timeout=10.0, label="상태 확인")
+                self.worker.run(lambda c: c.doc_name, timeout=10.0, label="상태 확인",
+                                queue_wait=0.5, mark_stuck=False)
                 info = self.worker.status()
                 info["probe"] = "ok"
             except Exception as e:
@@ -603,15 +607,16 @@ def t_list_entities(svc, a):
         selector["window"] = a["window"]
         selector["mode"] = a.get("mode", "crossing")
 
-    def job(c):
-        if selector:
-            return [cad_reader.read_entity(e, c.lib) for _, e in c.select(selector)]
-        return cad_reader.read_entities(c.doc, c.lib)
-
-    entities = svc.run(job, "list_entities", timeout=LONG_TIMEOUT)
-    total = len(entities)
     limit = max(1, int(a.get("limit", 100)))
-    page = entities[:limit]
+
+    def job(c):
+        # 돌려줄 limit개까지만 상세히 읽는다 (엔티티 하나에 COM 속성 읽기 ~10번)
+        if selector:
+            targets = [e for _, e in c.select(selector)]
+            return len(targets), cad_reader.read_entities(c.doc, c.lib, limit, entities=targets)
+        return c.doc.ModelSpace.Count, cad_reader.read_entities(c.doc, c.lib, limit)
+
+    total, page = svc.run(job, "list_entities", timeout=LONG_TIMEOUT)
     if not a.get("include_geometry"):
         page = [cad_reader.compact_entity(e) for e in page]
     fields = a.get("fields")
@@ -724,7 +729,8 @@ def t_document(svc, a):
 def t_save_drawing(svc, a):
     path = a["file_path"]
     if not os.path.isabs(path):
-        path = os.path.join(CONFIG["output"]["directory"], path)
+        base = CONFIG.get("output", {}).get("directory") or os.path.join(SRC_DIR, "..", "output")
+        path = os.path.abspath(os.path.join(base, path))
     saved = svc.run(lambda c: c.save_drawing(path), "save_drawing", timeout=LONG_TIMEOUT)
     return f"저장 완료: {saved}"
 
@@ -859,7 +865,9 @@ async def main():
         except CADBusy as e:
             return _error_result("CAD_BUSY", str(e))
         except KeyError as e:
-            return _error_result("INVALID_ARGS", f"필수 인자 누락: {e}")
+            # 필수 인자는 JSON 스키마로 이미 검증되므로, 여기 오는 건 draw spec의
+            # 빠진 키나 설정(config.json) 누락이다
+            return _error_result("MISSING_VALUE", f"필요한 값이 없습니다(인자 항목 또는 설정): {e}")
         except (ValueError, TypeError) as e:
             return _error_result("INVALID_ARGS", str(e))
         except CADError as e:

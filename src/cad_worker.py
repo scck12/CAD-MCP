@@ -235,8 +235,15 @@ class CADWorker:
 
     def run(self, func: Callable[[CADController], Any],
             timeout: Optional[float] = None, label: str = "CAD 작업",
-            connect: bool = True) -> Any:
-        """작업 스레드에서 func(controller)를 실행하고 결과를 반환"""
+            connect: bool = True, queue_wait: Optional[float] = None,
+            mark_stuck: bool = True) -> Any:
+        """작업 스레드에서 func(controller)를 실행하고 결과를 반환
+
+        queue_wait: 앞 작업이 끝나길 기다리는 최대 시간 (기본 QUEUE_WAIT_LIMIT)
+        mark_stuck: 실행 시간 초과 시 스레드를 막힘으로 표시할지. 상태 확인처럼
+                    부가적인 요청은 False로 해서 전체를 막지 않는다.
+        """
+        wait_limit = QUEUE_WAIT_LIMIT if queue_wait is None else queue_wait
         self.start()
         with self._lock:
             if self._stuck_job is not None:
@@ -259,7 +266,7 @@ class CADWorker:
             with self._lock:
                 blocked = self._stuck_job is not None and self._generation == generation
                 replaced = self._generation != generation
-            if blocked or replaced or waited >= QUEUE_WAIT_LIMIT:
+            if blocked or replaced or waited >= wait_limit:
                 with job.lock:
                     if not job.started.is_set():
                         job.cancelled = True
@@ -267,7 +274,7 @@ class CADWorker:
                             raise CADBusy("연결 재시작으로 취소된 요청입니다. 다시 호출하세요.")
                         if blocked:
                             raise CADBusy(self._stuck_message())
-                        raise CADBusy(f"앞선 작업이 {QUEUE_WAIT_LIMIT:.0f}초 넘게 끝나지 않아 "
+                        raise CADBusy(f"앞선 작업이 {wait_limit:.0f}초 넘게 끝나지 않아 "
                                       f"'{label}' 요청을 실행하지 못했습니다.")
                 break   # 마지막 순간에 시작됨
 
@@ -275,9 +282,12 @@ class CADWorker:
         if not job.done.wait(limit):
             job.timed_out = True
             with self._lock:
-                if self._generation == generation and not job.done.is_set():
+                if mark_stuck and self._generation == generation and not job.done.is_set():
                     self._stuck_job = job
             if not job.done.is_set():
+                if not mark_stuck:
+                    raise CADBusy(f"'{label}'에 CAD가 {limit:.0f}초 동안 응답하지 않습니다. "
+                                  "캐디안에 대화상자나 명령 입력 대기가 떠 있는지 확인하세요.")
                 raise CADBusy(f"'{label}' 작업이 {limit:.0f}초 안에 끝나지 않았습니다. "
                               + self._stuck_message())
 
